@@ -1,0 +1,4608 @@
+
+# Loading libraries
+
+```{r}
+library(limma)
+library(Seurat)         
+library(SeuratObject)    
+library(dplyr)
+library(tidybulk)
+library(tidySummarizedExperiment)
+library(ggplot2)
+library(ggrepel)
+library(plotly)
+library(tidyverse)
+library(htmlwidgets)
+library(DESeq2)
+library(reshape2)
+library(UpSetR)
+library(pheatmap)
+library(stringr)
+library(rstatix)
+library(ggsignif)
+library(cbioportalR)
+library(AnVIL)
+library(cBioPortalData)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(MultiAssayExperiment)
+library(msigdbr)
+library(fgsea)
+library(ggplot2)
+library(ggvenn)
+library(biomaRt)
+library(org.Hs.eg.db)
+suppressPackageStartupMessages({library(survival); library(survminer)})
+```
+# Preparing the Data
+
+Loading the object
+
+```{r}
+# Load your Seurat object from the RDS file
+seurat_obj <- readRDS("Combined.New.Object_with_Andy_cell_type_with_reduction.rds")
+```
+
+```{r}
+# Specify the samples to remove
+samples_to_remove <- c("Other001_D", "Other001_R")
+
+# Find the cells that match these sample labels in the 'new_labels' metadata
+cells_to_remove <- rownames(seurat_obj@meta.data)[seurat_obj$new_labels %in% samples_to_remove]
+
+# Use the subset function to remove these cells from the Seurat object
+seurat_obj <- subset(seurat_obj, cells = cells_to_remove, invert = TRUE)
+```
+
+Visualizing the Seurat Object
+
+```{r}
+# Plot UMAP colored by cluster
+DimPlot(seurat_obj, reduction = "umap", group.by = "seurat_clusters")
+
+# Plot UMAP colored by a specific metadata column, like cell type
+DimPlot(seurat_obj, reduction = "umap", group.by = "dominant_cell_type")
+```
+
+```{r}
+bulk <- AggregateExpression(seurat_obj, group.by = "new_labels", return.seurat = FALSE)
+```
+
+# First all D vs all R
+
+```{r}
+# The result is a list with RNA as a sparse matrix
+bulk_counts <- bulk$RNA  # Access the sparse matrix with genes as rows and identity classes as columns
+
+# Example of how to view this sparse matrix
+head(bulk_counts)  
+```
+
+### Subseting the matrix
+
+```{r}
+# Convert sparse matrix to regular matrix (for DESeq2)
+bulk_matrix <- as.matrix(bulk_counts)
+
+#Filtering for low expressed genes
+filtered_bulk_matrix <- bulk_matrix[apply(bulk_matrix, 1, function(x) sum(x > 10)) >= 2, ]
+
+# Create metadata (e.g., Diagnosis and Relapse labels for your columns)
+meta_data <- data.frame(
+  sample = colnames(filtered_bulk_matrix),
+  condition = ifelse(grepl("-D", colnames(filtered_bulk_matrix)), "Diagnosis", "Relapse"),
+  stringsAsFactors = FALSE
+)
+
+
+
+```
+
+### PCA
+
+```{r}
+# Step 1: Create the SummarizedExperiment object using filtered bulk matrix and metadata
+k9.se <- SummarizedExperiment(
+  assays = list(counts = as.matrix(filtered_bulk_matrix)),
+  colData = meta_data
+)
+
+# Step 2: Inspect the SummarizedExperiment object
+print(k9.se)
+
+# Step 3: QC - Filter out low abundant genes and scale the abundance
+# Assuming "condition" is the column we want to use as a factor of interest
+counts_scaled <- k9.se %>%
+  keep_abundant(factor_of_interest = condition) %>%
+  scale_abundance()
+
+# Check the scaled data
+colData(counts_scaled)
+
+# Optional: Plot the distribution of counts before and after scaling
+counts_scaled %>%
+  pivot_longer(cols = c("counts", "counts_scaled"), names_to = "source", values_to = "abundance") %>%
+  ggplot(aes(x = abundance + 1, color = .sample)) +
+  geom_density() +
+  facet_wrap(~source) +
+  scale_x_log10() 
+
+# Step 4: Perform PCA
+counts_scal_PCA <- counts_scaled %>%
+  reduce_dimensions(method = "PCA", .dims = 3)
+
+# Step 5: Check the PCA results
+colData(counts_scal_PCA)
+
+# Step 6: Plot 2D PCA
+counts_scal_PCA %>%
+  pivot_sample() %>%
+  ggplot(aes(x = PC1, y = PC2, colour = condition)) +
+  geom_point() +
+  geom_text_repel(aes(label = .sample), show.legend = FALSE, size = 3) +
+  labs(title = "PCA for all D vs all R") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+
+
+```
+
+### DEseq
+
+```{r}
+# Create DESeq2 dataset
+dds <- DESeqDataSetFromMatrix(countData = filtered_bulk_matrix, colData = meta_data, design = ~ condition)
+
+# Run DESeq2
+dds <- DESeq(dds)
+
+# Get DE results
+res <- results(dds)
+summary(res)
+
+de_results_all_D_vs_R <- as.data.frame(res)
+```
+# Task 1 Compare all Diagnosis vs all Relapse
+
+## Plotting all D vs all R
+
+### Volcano plot
+
+```{r}
+## Plotting all D vs all R
+
+### Volcano plot
+
+# Define custom colors, sizes, and alphas for the plot
+cols <- c("up" = "#ffad73", "down" = "#26b3ff", "ns" = "grey")
+sizes <- c("up" = 2, "down" = 2, "ns" = 1)
+alphas <- c("up" = 1, "down" = 1, "ns" = 0.5)
+
+de_results_all_D_vs_R <- de_results_all_D_vs_R %>%
+  rownames_to_column("GeneSymbol")
+
+
+volcano_data <- de_results_all_D_vs_R %>%
+  # Select only the necessary columns
+  dplyr::select(GeneSymbol, log2FoldChange, padj) %>%
+  # Classify genes based on fold change and adjusted p-value
+  mutate(FoldChange = 2^log2FoldChange) %>%
+  mutate(GeneType = case_when(
+    FoldChange >= 1.5 & padj <= 0.316 ~ "up",  # Update the padj threshold to 0.316
+    FoldChange <= (1/1.5) & padj <= 0.316 ~ "down",
+    TRUE ~ "ns"
+  ))
+
+# Update the plot theme to ensure larger font sizes
+volcano_plot <- volcano_data %>%
+  ggplot(aes(x = log2(FoldChange), y = -log10(padj),
+             fill = GeneType, size = GeneType, alpha = GeneType)) +
+  geom_point(shape = 21, colour = "black") +
+  geom_hline(yintercept = -log10(0.316), linetype = "dashed") +  # Update the y-intercept to -log10(0.316)
+  geom_vline(xintercept = c(log2(0.5), log2(2)), linetype = "dashed") +
+  scale_fill_manual(values = cols) +
+  scale_size_manual(values = sizes) +
+  scale_alpha_manual(values = alphas) +
+  geom_text_repel(
+    data = filter(volcano_data, padj < 0.316),  # Update the filtering for the labels
+                  aes(x = log2(FoldChange), y = -log10(padj), label = GeneSymbol), 
+                  size = 5,  
+                  color = "darkblue", 
+                  max.overlaps = Inf,
+                  min.segment.length = Inf,
+                  inherit.aes = FALSE) +
+  labs(title = "Volcano Plot of all D vs all R with 0.316 adjpval",  # Update the title to reflect the new threshold
+       x = "log2(Fold Change)", 
+       y = "-log10(Adjusted P-value)") +
+  theme_minimal(base_family = "Arial") +  
+  theme(
+    panel.background = element_rect(fill = "white", colour = NA), 
+    plot.background = element_rect(fill = "white", colour = NA),  
+    legend.position = "bottom",
+    plot.title = element_text(size = 20, face = "bold"),   
+    axis.title.x = element_text(size = 18),                
+    axis.title.y = element_text(size = 18),                
+    axis.text = element_text(size = 14),                   
+    legend.text = element_text(size = 14),                 
+    legend.title = element_text(size = 16)                 
+  )
+
+volcano_plot
+
+# Save the plot with high resolution and proper background settings
+ggsave("tasks_results/task1_allD_vs_allR/volcano_plot_allD_vs_allR_padj0.5.png", plot = volcano_plot, 
+       width = 16, height = 9, dpi = 300, bg = "white")  # Ensure background is set to white
+
+```
+
+### violin plots for all upregulated genes
+
+```{r}
+
+# Step 1: Filter the significant genes based on the volcano data
+significant_genes <- volcano_data %>% 
+  filter(padj <= 0.316 & abs(log2(FoldChange)) >= log2(1.5)) %>%  # Include both upregulated and downregulated genes
+  pull(GeneSymbol)
+
+# Step 2: Subset the bulk matrix for these significant genes
+significant_genes_data <- filtered_bulk_matrix[rownames(filtered_bulk_matrix) %in% significant_genes, ]
+
+# Step 3: Convert the matrix to long format for ggplot
+significant_genes_df <- as.data.frame(significant_genes_data) %>%
+  rownames_to_column(var = "gene") %>%
+  pivot_longer(cols = -gene, names_to = "sample", values_to = "expression")
+
+# Step 4: Ensure that the meta_data has a 'subtype' column
+# If it doesn't exist, create it based on the 'sample' name or other criteria
+if (!"subtype" %in% colnames(meta_data)) {
+  meta_data <- meta_data %>%
+    mutate(subtype = case_when(
+      grepl("ETV", sample) ~ "ETV",
+      grepl("LH", sample) ~ "LH",
+      grepl("NH", sample) ~ "NH",
+      grepl("PH", sample) ~ "PH",
+      TRUE ~ "Unknown"  # Assign 'Unknown' if the pattern doesn't match any subtype
+    ))
+}
+
+# Step 5: Merge the expression data with the updated metadata
+significant_genes_df <- merge(significant_genes_df, meta_data, by.x = "sample", by.y = "sample")
+
+# Step 6: Label samples in "Relapse" with expression > 20
+significant_genes_df <- significant_genes_df %>%
+  mutate(label = ifelse(condition == "Relapse" & expression > 20, subtype, NA))  # Use subtype for labeling
+
+
+
+```
+
+### Saving violin plots individually
+
+```{r}
+# Define the directory to save the plots
+output_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Integrated_D_R_curtis/tasks_results/task1_allD_vs_allR/violinplots/"
+
+# Loop over each significant gene to create and save individual violin plots
+lapply(unique(significant_genes_df$gene), function(gene_name) {
+  # Subset the data for the current gene
+  gene_data <- significant_genes_df %>% filter(gene == gene_name)
+  
+  # Create the violin plot for the current gene
+  p <- ggplot(gene_data, aes(x = condition, y = expression, fill = condition)) +
+    geom_violin(trim = FALSE) +
+    geom_jitter(width = 0.2, size = 1.5, color = "black", alpha = 0.5) +
+    geom_text_repel(aes(label = label), na.rm = TRUE, size = 5, color = "#800000") +
+    labs(title = paste("Violin Plot of", gene_name, "Expression in Relapse vs Diagnosis"),
+         x = "Condition",
+         y = "Expression Level") +
+    theme_minimal() +
+    theme(legend.position = "none") +
+    scale_fill_manual(values = c("Diagnosis" = "#ffad73", "Relapse" = "#26b3ff"))  # Add custom fill colors
+  
+  # Create the file name with format "<gene_name>_violin_plot.png"
+  file_name <- paste0(gene_name, "_violin_plot.png")
+  
+  # Save the plot to the output directory
+  ggsave(filename = file.path(output_dir, file_name), plot = p, width = 8, height = 6, dpi = 300, bg = "white")
+})
+
+```
+
+### Calculation FPKM
+
+```{r}
+# Create a data frame with gene lengths
+gene_lengths <- data.frame(
+  GeneSymbol = c("MNDA", "MGST1", "LYZ", "OBSL1", "TWIST2", "PLA2G4A"),
+  Length = c(18155, 262117, 5853, 21131, 62502, 160032)  # Length in base pairs
+)
+
+dds <- DESeqDataSetFromMatrix(countData = filtered_bulk_matrix, 
+                              colData = meta_data, 
+                              design = ~ condition)
+
+# Step 2: Add gene lengths to the DESeqDataSet
+# Assuming the 'gene_lengths' data frame contains the gene names and lengths in base pairs
+mcols(dds)$basepairs <- gene_lengths$Length[match(rownames(dds), gene_lengths$GeneSymbol)]
+
+# Step 3: Run the DESeq2 normalization
+dds <- DESeq(dds)
+
+# Step 4: Calculate FPKM values using the fpkm() function
+fpkm_values_deseq2 <- fpkm(dds, robust = TRUE)  # Calculate FPKM using size factors (robust=TRUE by default)
+
+# Step 5: Convert the matrix to a data frame for easier handling
+fpkm_values_deseq2_df <- as.data.frame(fpkm_values_deseq2) %>%
+  rownames_to_column(var = "GeneSymbol") %>%
+  pivot_longer(cols = -GeneSymbol, names_to = "sample", values_to = "FPKM")
+
+# Step 6: Filter the FPKM values for the genes of interest
+fpkm_values_deseq2_df <- fpkm_values_deseq2_df %>%
+  filter(GeneSymbol %in% c("MNDA", "MGST1", "LYZ", "OBSL1", "TWIST2", "PLA2G4A"))
+
+# Display the head of the FPKM values
+fpkm_values_deseq2_df
+
+
+# Step 1: Separate the "sample" column into "sample_id" and "condition"
+fpkm_values_deseq2_df <- fpkm_values_deseq2_df %>%
+  separate(sample, into = c("sample_id", "condition"), sep = "-", remove = FALSE)
+
+# Step 2: Pivot the data to get separate columns for "FPKM Diagnosis" and "FPKM Relapse"
+fpkm_values_final <- fpkm_values_deseq2_df %>%
+  pivot_wider(names_from = condition, values_from = FPKM, 
+              names_prefix = "FPKM_") %>%
+  group_by(GeneSymbol, sample_id) %>%
+  summarise(FPKM_Diagnosis = sum(FPKM_D, na.rm = TRUE), 
+            FPKM_Relapse = sum(FPKM_R, na.rm = TRUE), .groups = 'drop')
+
+
+fpkm_values_final
+
+
+#write.csv(fpkm_values_final, "fpkm_topDvsR.csv", col.names = T)
+```
+
+## Task 1.2 Subseting based on LYZ expression
+
+```{r}
+# Define the groups based on the provided table
+group1_samples <- c("ETV003", "NH003", "NH006", "NH002", "NH004", "PH001", "PH002", "LH003")
+group2_samples <- c("ETV001", "ETV004", "ETV005", "NH008", "NH001", "NH005", "ETV002", "PH003", "NH007", "LH002", "LH001")
+
+# Filter meta_data for the diagnosis and relapse samples in each group
+group1_meta <- meta_data %>% 
+  filter(gsub("-[DR]", "", sample) %in% group1_samples)
+
+group2_meta <- meta_data %>%
+  filter(gsub("-[DR]", "", sample) %in% group2_samples)
+
+# Subset the bulk matrix for the corresponding samples
+group1_matrix <- filtered_bulk_matrix[, group1_meta$sample, drop = FALSE]
+group2_matrix <- filtered_bulk_matrix[, group2_meta$sample, drop = FALSE]
+
+# Here PCA for each
+
+# Step 2: Run DESeq2 Analysis for Each Group Separately
+# Group 1 DESeq2 analysis
+dds_group1 <- DESeqDataSetFromMatrix(countData = group1_matrix, colData = group1_meta, design = ~ condition)
+dds_group1 <- DESeq(dds_group1)
+res_group1 <- results(dds_group1)
+
+# Group 2 DESeq2 analysis
+dds_group2 <- DESeqDataSetFromMatrix(countData = group2_matrix, colData = group2_meta, design = ~ condition)
+dds_group2 <- DESeq(dds_group2)
+res_group2 <- results(dds_group2)
+
+# Step 3: Identify Significant Genes for Each Group
+padj_threshold <- 0.316
+log2FC_threshold <- log2(1.5)
+
+# Significant genes for Group 1
+sig_genes_group1 <- as.data.frame(res_group1) %>%
+  rownames_to_column(var = "GeneSymbol") %>%
+  filter(padj < padj_threshold & abs(log2FoldChange) >= log2FC_threshold)
+
+# Significant genes for Group 2
+sig_genes_group2 <- as.data.frame(res_group2) %>%
+  rownames_to_column(var = "GeneSymbol") %>%
+  filter(padj < padj_threshold & abs(log2FoldChange) >= log2FC_threshold)
+
+# Step 4: Compare DE Genes Between the Groups
+# Find overlapping and exclusive genes
+overlap_genes <- intersect(sig_genes_group1$GeneSymbol, sig_genes_group2$GeneSymbol)
+exclusive_genes_group1 <- setdiff(sig_genes_group1$GeneSymbol, sig_genes_group2$GeneSymbol)
+exclusive_genes_group2 <- setdiff(sig_genes_group2$GeneSymbol, sig_genes_group1$GeneSymbol)
+
+# Output results
+list(
+  overlap_genes = overlap_genes,
+  exclusive_genes_group1 = exclusive_genes_group1,
+  exclusive_genes_group2 = exclusive_genes_group2
+)
+```
+
+### PCA group 1
+
+```{r}
+
+# Step 1: Create SummarizedExperiment for Group 1 using filtered matrix and metadata
+group1_se <- SummarizedExperiment(
+  assays = list(counts = as.matrix(group1_matrix)),
+  colData = group1_meta
+)
+
+# Step 2: QC - Filter out low abundant genes and scale abundance
+counts_scaled_group1 <- group1_se %>%
+  keep_abundant(factor_of_interest = condition) %>%
+  scale_abundance()
+
+# Step 3: Perform PCA
+counts_scaled_group1_PCA <- counts_scaled_group1 %>%
+  reduce_dimensions(method = "PCA", .dims = 3)
+
+# Step 4: Plot 2D PCA for Group 1
+counts_scaled_group1_PCA %>%
+  pivot_sample() %>%
+  ggplot(aes(x = PC1, y = PC2, colour = condition)) +
+  geom_point() +
+  geom_text_repel(aes(label = .sample), show.legend = FALSE, size = 3) +
+  labs(title = "PCA for Group 1 (LYZ<2FC)") +
+  theme_minimal() +
+  theme(legend.position = "bottom") -> PCA_group1
+
+
+ggsave("tasks_results/task1.2_LYZ_grouping/PCA_Group_1_(LYZ<2FC).png", plot = PCA_group1, 
+       width = 16, height = 9, dpi = 300, bg = "white")  # Ensure background is set to white
+
+```
+
+### Volcano plot group 1
+
+```{r}
+# Convert DESeq2 results to a data frame for Group 1
+volcano_data_group1 <- as.data.frame(res_group1) %>%
+  rownames_to_column("GeneSymbol") %>%
+  dplyr::select(GeneSymbol, log2FoldChange, padj) %>%
+  mutate(FoldChange = 2^log2FoldChange) %>%
+  mutate(GeneType = case_when(
+    FoldChange >= 1.5 & padj <= 0.316 ~ "up",
+    FoldChange <= (1/1.5) & padj <= 0.316 ~ "down",
+    TRUE ~ "ns"
+  ))
+
+# Create volcano plot for Group 1
+volcano_plot_group1 <- ggplot(volcano_data_group1, aes(x = log2(FoldChange), y = -log10(padj),
+                                                       fill = GeneType, size = GeneType, alpha = GeneType)) +
+  geom_point(shape = 21, colour = "black") +
+  geom_hline(yintercept = -log10(0.316), linetype = "dashed") +
+  geom_vline(xintercept = c(log2(0.5), log2(2)), linetype = "dashed") +
+  scale_fill_manual(values = cols) +
+  scale_size_manual(values = sizes) +
+  scale_alpha_manual(values = alphas) +
+  geom_text_repel(
+    data = filter(volcano_data_group1, padj < 0.316), 
+    aes(x = log2(FoldChange), y = -log10(padj), label = GeneSymbol), 
+    size = 5, color = "darkblue", max.overlaps = Inf, min.segment.length = Inf, inherit.aes = FALSE) +
+  labs(title = "Volcano Plot for Group 1 (LYZ<2FC)", x = "log2(Fold Change)", y = "-log10(Adjusted P-value)") +
+  theme_minimal(base_family = "Arial") +
+  theme(
+    panel.background = element_rect(fill = "white", colour = NA),
+    plot.background = element_rect(fill = "white", colour = NA),
+    legend.position = "bottom",
+    plot.title = element_text(size = 20, face = "bold"),
+    axis.title.x = element_text(size = 18),
+    axis.title.y = element_text(size = 18),
+    axis.text = element_text(size = 14),
+    legend.text = element_text(size = 14),
+    legend.title = element_text(size = 16)
+  )
+
+# Display the plot
+volcano_plot_group1
+
+ggsave("tasks_results/task1.2_LYZ_grouping/volcano_Group_1_(LYZ<2FC).png", plot = volcano_plot_group1, 
+       width = 16, height = 9, dpi = 300, bg = "white")  # Ensure background is set to white
+
+```
+
+### PCA group 2
+
+```{r}
+# Step 1: Create SummarizedExperiment for Group 2
+group2_se <- SummarizedExperiment(
+  assays = list(counts = as.matrix(group2_matrix)),
+  colData = group2_meta
+)
+
+# Step 2: QC - Filter out low abundant genes and scale abundance
+counts_scaled_group2 <- group2_se %>%
+  keep_abundant(factor_of_interest = condition) %>%
+  scale_abundance()
+
+# Step 3: Perform PCA
+counts_scaled_group2_PCA <- counts_scaled_group2 %>%
+  reduce_dimensions(method = "PCA", .dims = 3)
+
+# Step 4: Plot 2D PCA for Group 2
+counts_scaled_group2_PCA %>%
+  pivot_sample() %>%
+  ggplot(aes(x = PC1, y = PC2, colour = condition)) +
+  geom_point() +
+  geom_text_repel(aes(label = .sample), show.legend = FALSE, size = 3) +
+  labs(title = "PCA for Group 2 (LYZ>2FC)") +
+  theme_minimal() +
+  theme(legend.position = "bottom") -> pca_group2
+
+ggsave("tasks_results/task1.2_LYZ_grouping/pca_Group_2_(LYZ>2FC).png", plot = pca_group2, 
+       width = 16, height = 9, dpi = 300, bg = "white")  # Ensure background is set to white
+
+```
+
+### Volcano plot group 2
+
+```{r}
+# Convert DESeq2 results to a data frame for Group 2
+volcano_data_group2 <- as.data.frame(res_group2) %>%
+  rownames_to_column("GeneSymbol") %>%
+  dplyr::select(GeneSymbol, log2FoldChange, padj) %>%
+  mutate(FoldChange = 2^log2FoldChange) %>%
+  mutate(GeneType = case_when(
+    FoldChange >= 1.5 & padj <= 0.316 ~ "up",
+    FoldChange <= (1/1.5) & padj <= 0.316 ~ "down",
+    TRUE ~ "ns"
+  ))
+
+# Create volcano plot for Group 2
+volcano_plot_group2 <- ggplot(volcano_data_group2, aes(x = log2(FoldChange), y = -log10(padj),
+                                                       fill = GeneType, size = GeneType, alpha = GeneType)) +
+  geom_point(shape = 21, colour = "black") +
+  geom_hline(yintercept = -log10(0.316), linetype = "dashed") +
+  geom_vline(xintercept = c(log2(0.5), log2(2)), linetype = "dashed") +
+  scale_fill_manual(values = cols) +
+  scale_size_manual(values = sizes) +
+  scale_alpha_manual(values = alphas) +
+  geom_text_repel(
+    data = filter(volcano_data_group2, padj < 0.316), 
+    aes(x = log2(FoldChange), y = -log10(padj), label = GeneSymbol), 
+    size = 5, color = "darkblue", max.overlaps = Inf, min.segment.length = Inf, inherit.aes = FALSE) +
+  labs(title = "Volcano Plot for Group 2 (LYZ>2FC)", x = "log2(Fold Change)", y = "-log10(Adjusted P-value)") +
+  theme_minimal(base_family = "Arial") +
+  theme(
+    panel.background = element_rect(fill = "white", colour = NA),
+    plot.background = element_rect(fill = "white", colour = NA),
+    legend.position = "bottom",
+    plot.title = element_text(size = 20, face = "bold"),
+    axis.title.x = element_text(size = 18),
+    axis.title.y = element_text(size = 18),
+    axis.text = element_text(size = 14),
+    legend.text = element_text(size = 14),
+    legend.title = element_text(size = 16)
+  )
+
+# Display the plot
+volcano_plot_group2
+
+ggsave("tasks_results/task1.2_LYZ_grouping/volcano_Group_2_(LYZ>2FC).png", plot = volcano_plot_group2, 
+       width = 16, height = 9, dpi = 300, bg = "white")  # Ensure background is set to white
+
+
+```
+
+## Task 1.3 Avg expression of specific genes
+ 
+### Avg expression of specific genes, zscore
+
+```{r}
+# Step 1: Select the RNA count values for GEM
+gem_counts <- filtered_bulk_matrix["GEM", , drop = FALSE]  # Select the GEM row
+
+# Step 2: Transpose to make samples as rows and genes as columns for easier manipulation
+gem_counts <- t(gem_counts)
+
+# Step 3: Convert to a data frame and add sample information
+gem_counts_df <- as.data.frame(gem_counts)
+gem_counts_df$Sample <- rownames(gem_counts_df)  # Add sample names as a column
+
+# Step 4: Add metadata (Diagnosis or Relapse) for each sample
+gem_counts_df <- gem_counts_df %>%
+  mutate(
+    Condition = ifelse(grepl("-D$", Sample), "Diagnosis", "Relapse"),  # Identify Diagnosis (D) and Relapse (R)
+    Patient = sub("-[DR]$", "", Sample)  # Extract patient ID by removing the -D or -R suffix
+  )
+
+# Step 5: Combine Patient and Condition columns to format as ETV001-D, ETV001-R, etc.
+gem_counts_df <- gem_counts_df %>%
+  mutate(Patient_Condition = paste0(Patient, "-", substr(Condition, 1, 1)))  # Create labels like ETV001-D
+
+# Step 6: Reorder the data frame by Patient_Condition to ensure correct order on x-axis
+gem_counts_df <- gem_counts_df %>%
+  arrange(Patient, Condition)
+
+# Step 7: Plot the RNA counts of GEM with specified x-axis labels and a horizontal line at y = 0
+ggplot(gem_counts_df, aes(x = Patient_Condition, y = GEM, fill = Condition)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8)) +
+  geom_hline(yintercept = 0, color = "black", linetype = "dashed") +  # Add horizontal line at 0
+  labs(
+    title = "RNA Counts of GEM for Diagnosis and Relapse Across Patients",
+    y = "RNA Count",
+    x = "Sample",
+    fill = "Condition"
+  ) +
+  scale_fill_manual(values = c("Diagnosis" = "skyblue", "Relapse" = "salmon")) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),  # Rotate x-axis labels
+    axis.title.x = element_text(margin = margin(t = 10))  # Add space below x-axis labels
+  )
+
+```
+### Making the loop
+
+```{r}
+# Define the target genes
+target_genes <- c("GEM", "ZNF692", "USE1", "ZNF22", "INHBE", "CDK4", "RASL11A",
+                  "CYP7B1", "SLC35F1", "NFKBIE", "ZBTB10", "CTSB", "CNBD2",
+                  "CDC42EP4", "OLAH", "FAM76B")
+
+# Function to create a plot for a single gene
+plot_gene_counts <- function(gene) {
+  # Step 1: Select the RNA count values for the gene
+  gene_counts <- filtered_bulk_matrix[gene, , drop = FALSE]  # Select the gene row
+  
+  # Step 2: Transpose to make samples as rows and genes as columns for easier manipulation
+  gene_counts <- t(gene_counts)
+  
+  # Step 3: Convert to a data frame and add sample information
+  gene_counts_df <- as.data.frame(gene_counts)
+  gene_counts_df$Sample <- rownames(gene_counts_df)  # Add sample names as a column
+  
+  # Step 4: Add metadata (Diagnosis or Relapse) for each sample
+  gene_counts_df <- gene_counts_df %>%
+    mutate(
+      Condition = ifelse(grepl("-D$", Sample), "Diagnosis", "Relapse"),  # Identify Diagnosis (D) and Relapse (R)
+      Patient = sub("-[DR]$", "", Sample)  # Extract patient ID by removing the -D or -R suffix
+    )
+  
+  # Step 5: Combine Patient and Condition columns to format as ETV001-D, ETV001-R, etc.
+  gene_counts_df <- gene_counts_df %>%
+    mutate(Patient_Condition = paste0(Patient, "-", substr(Condition, 1, 1)))  # Create labels like ETV001-D
+  
+  # Step 6: Reorder the data frame by Patient_Condition to ensure correct order on x-axis
+  gene_counts_df <- gene_counts_df %>%
+    arrange(Patient, Condition)
+  
+  # Step 7: Plot the RNA counts for the gene with specified x-axis labels and a horizontal line at y = 0
+  ggplot(gene_counts_df, aes(x = Patient_Condition, y = get(gene), fill = Condition)) +
+    geom_bar(stat = "identity", position = position_dodge(width = 0.8)) +
+    geom_hline(yintercept = 0, color = "black", linetype = "dashed") +  # Add horizontal line at 0
+    labs(
+      title = paste("RNA Counts of", gene, "for Diagnosis and Relapse Across Patients"),
+      y = "RNA Count",
+      x = "Sample",
+      fill = "Condition"
+    ) +
+    scale_fill_manual(values = c("Diagnosis" = "skyblue", "Relapse" = "salmon")) +
+    theme_minimal() +
+    theme(
+       plot.background = element_rect(fill = "white", color = NA),  # White plot background
+      panel.background = element_rect(fill = "white", color = NA),  # White panel background
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),  # Rotate x-axis labels
+      axis.title.x = element_text(margin = margin(t = 10))  # Add space below x-axis labels
+    )
+}
+
+# Apply the function to each gene in target_genes and save the plots in a list
+plots_list <- map(target_genes, plot_gene_counts)
+
+# Optional: Print or save each plot
+# Example to display a plot, e.g., the first plot
+print(plots_list[[1]])
+
+# Specify the output directory for the plots
+output_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Integrated_D_R_curtis/tasks_results/task1.3_avg_expression_rnacounts"
+
+# Ensure the directory exists
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+# Save each plot as a PNG in the specified output directory
+for (i in seq_along(target_genes)) {
+  ggsave(
+    filename = file.path(output_dir, paste0("plot_", target_genes[i], ".png")),
+    plot = plots_list[[i]],
+    width = 10,
+    height = 6,
+    dpi = 300  # High resolution for PNG
+  )
+}
+
+# This has been a test
+```
+
+# Filtering bulk_matrix by stjudes_filtered
+
+```{r}
+# Extract the gene names from lowexp_filt_heatmap_data
+genes_to_keep <- rownames(lowexp_filt_heatmap_data)
+
+# Filter filtered_bulk_matrix to retain only the genes in genes_to_keep
+filtered_bulk_matrix_subset <- filtered_bulk_matrix[rownames(filtered_bulk_matrix) %in% genes_to_keep, ]
+
+# Check the result
+dim(filtered_bulk_matrix_subset) 
+
+# Calculate Z-scores for each gene (row-wise)
+filtered_bulk_matrix_subset_zscore_matrix <- t(apply(filtered_bulk_matrix_subset, 1, function(x) {
+  (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
+}))
+
+```
+
+```{r}
+library(pheatmap)
+
+# Generate the heatmap
+library(pheatmap)
+
+library(pheatmap)
+
+# Generate the heatmap
+pheatmap::pheatmap(
+  filtered_bulk_matrix_subset_zscore_matrix,
+  cluster_rows = TRUE,       # Cluster rows (genes)
+  cluster_cols = TRUE,       # Cluster columns (samples)
+  main = "Z-Scores of Genes (Filtered for Low Expression)",  # Heatmap title
+  show_rownames = TRUE,       # Show gene names
+  show_colnames = TRUE,       # Show sample names
+  color = colorRampPalette(c("blue", "white", "red"))(50),  # Color gradient
+  fontsize_col = 8,           # Font size for column names
+  fontsize_row = 6            # Font size for row names
+)
+```
+
+## Rownormalizing this
+
+```{r}
+# Step 1: Calculate Z-scores for all genes in filtered_bulk_matrix
+filtered_bulk_matrix_zscore <- t(apply(filtered_bulk_matrix, 1, function(x) {
+  (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
+}))
+
+# Step 2: Filter for genes of interest
+# Extract the gene names from lowexp_filt_heatmap_data
+genes_to_keep <- rownames(lowexp_filt_heatmap_data)
+
+# Subset the Z-score matrix to retain only the genes in genes_to_keep
+filtered_bulk_matrix_subset_zscore <- filtered_bulk_matrix_zscore[rownames(filtered_bulk_matrix_zscore) %in% genes_to_keep, ]
+
+# Check the result
+dim(filtered_bulk_matrix_subset_zscore)
+
+library(pheatmap)
+
+# Set 'Gene' as row names and convert to a numeric matrix
+filtered_bulk_heatmap_data <- filtered_bulk_matrix_subset_zscore %>%
+  as.matrix()
+
+# Generate the heatmap
+pheatmap::pheatmap(
+  filtered_bulk_heatmap_data,
+  cluster_rows = T,       # Cluster rows (genes)
+  cluster_cols = T,       # Cluster columns (samples)
+  main = "Z-Score Heatmap of Filtered Bulk Matrix",  # Heatmap title
+  show_rownames = TRUE,       # Show gene names (set to FALSE if too many genes)
+  show_colnames = TRUE,       # Show sample names
+  color = colorRampPalette(c("blue", "white", "red"))(50),  # Color gradient
+  fontsize_col = 8,           # Font size for column names
+  fontsize_row = 6            # Font size for row names
+)
+
+```
+
+
+# Task 2 D vs R per subtype
+
+Make a volcano plot per subtype, get the files and make a venn diagram or upset of commons
+
+## PCA
+
+```{r}
+# List of subtypes
+subtypes <- unique(meta_data$subtype)
+
+# Create a list to store PCA results for each subtype
+pca_results_list <- list()
+
+# Loop through each subtype
+for (subtype in subtypes) {
+  # Step 1: Filter the bulk matrix and metadata for the current subtype
+  subtype_meta_data <- meta_data[meta_data$subtype == subtype, ]
+  subtype_bulk_matrix <- filtered_bulk_matrix[, subtype_meta_data$sample]
+  
+  # Step 2: Create the SummarizedExperiment object for the current subtype
+  subtype_se <- SummarizedExperiment(
+    assays = list(counts = as.matrix(subtype_bulk_matrix)),
+    colData = subtype_meta_data
+  )
+  
+  # Step 3: QC - Filter out low abundant genes and scale the abundance
+  counts_scaled <- subtype_se %>%
+    keep_abundant(factor_of_interest = condition) %>%  # Use {{}} for symbolic reference
+    scale_abundance()
+  
+  # Step 4: Perform PCA
+  counts_scal_PCA <- counts_scaled %>%
+    reduce_dimensions(method = "PCA", .dims = 3)
+  
+  # Step 5: Store the PCA results
+  pca_results_list[[subtype]] <- counts_scal_PCA
+  
+  # Step 6: Plot the PCA results for the current subtype
+  pca_plot <- counts_scal_PCA %>%
+    pivot_sample() %>%
+    ggplot(aes(x = PC1, y = PC2, colour = condition)) +
+    geom_point() +
+    geom_text_repel(aes(label = .sample), show.legend = FALSE, size = 3) +
+    labs(title = paste0("PCA for D vs R per Subtype: ", subtype),
+         x = "PC1", y = "PC2") +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+  
+  # Step 7: Print the plot (or save it)
+  print(pca_plot)
+}
+
+```
+
+Remove Other
+
+## Function for running dds
+
+```{r}
+# Initialize an empty list to store DE results per subtype
+de_results_subtype_list <- list()
+
+# Loop over each subtype and perform DE analysis for Diagnosis vs Relapse
+for (subtype in unique(meta_data$subtype)) {
+  
+  # Subset the metadata for the current subtype
+  subtype_meta_data <- meta_data[meta_data$subtype == subtype, ]
+  
+  # Subset the bulk matrix for the current subtype based on samples in metadata
+  bulk_subset <- filtered_bulk_matrix[, subtype_meta_data$sample]
+  
+  # Create a DESeq2 dataset
+  dds <- DESeqDataSetFromMatrix(
+    countData = bulk_subset,
+    colData = subtype_meta_data,
+    design = ~ condition
+  )
+  
+  # Run DESeq2 analysis
+  dds <- DESeq(dds)
+  
+  # Extract results, order by adjusted p-value
+  de_results <- results(dds, alpha = 0.05) %>%
+    as.data.frame() %>%
+    arrange(padj) 
+  
+  # Store the DE results in the list
+  de_results_subtype_list[[subtype]] <- de_results
+}
+
+# Example: Check DE results for a specific subtype (e.g., ETV)
+de_results_subtype_list$ETV
+```
+
+### Volcano Plot Task 2
+
+```{r, fig.align='default'}
+# Update the color, size, and alpha settings for the volcano plot
+cols <- c("up" = "#ffad73", "down" = "#26b3ff", "ns" = "grey")
+sizes <- c("up" = 2, "down" = 2, "ns" = 1)
+alphas <- c("up" = 1, "down" = 1, "ns" = 0.5)
+
+# Function to create a volcano plot with an adjusted p-value cutoff of 0.316
+create_volcano_plot <- function(de_results, subtype) {
+  # Prepare data for the volcano plot
+  volcano_data <- de_results %>%
+    rownames_to_column(var = "GeneSymbol") %>%
+    drop_na() %>%
+    dplyr::select(GeneSymbol, log2FoldChange, padj) %>%
+    mutate(FoldChange = 2^log2FoldChange) %>%
+    mutate(GeneType = case_when(
+      FoldChange >= 1.5 & padj <= 0.316 ~ "up",  # Update the padj threshold to 0.316
+      FoldChange <= (1/1.5) & padj <= 0.316 ~ "down",
+      TRUE ~ "ns"
+    ))
+
+  # Create the volcano plot
+  p <- ggplot(volcano_data, aes(x = log2(FoldChange), y = -log10(padj), 
+                                fill = GeneType, 
+                                size = GeneType, 
+                                alpha = GeneType)) +
+    geom_point(shape = 21, colour = "black") +
+    geom_hline(yintercept = -log10(0.316), linetype = "dashed") +  # Update the y-intercept to -log10(0.316)
+    geom_vline(xintercept = c(log2(1/1.5), log2(1.5)), linetype = "dashed") +
+    scale_fill_manual(values = cols) +
+    scale_size_manual(values = sizes) +
+    scale_alpha_manual(values = alphas) +
+    geom_text_repel(data = filter(volcano_data, padj < 0.316 & abs(log2(FoldChange)) >= log2(1.5)), # Update the filtering for the labels
+                    aes(x = log2(FoldChange), y = -log10(padj), label = GeneSymbol),
+                    size = 5,  # Increase label size
+                    color = "darkblue",
+                    max.overlaps = 10,  # Limit the number of label overlaps
+                    box.padding = 0.5,  # Increase padding to reduce clutter
+                    min.segment.length = 0.5,
+                    inherit.aes = FALSE) +
+    labs(title = paste("Volcano Plot of D vs R for", subtype, "with 0.316 adjpval"),
+         x = "Log2 Fold Change",
+         y = "-Log10 Adjusted P-Value") +
+    theme_minimal(base_family = "Arial") +
+    theme(
+      panel.backdground = element_rect(fill = "white", colour = NA),
+      plot.background = element_rect(fill = "white", colour = NA),
+      legend.position = "bottom",
+      plot.title = element_text(size = 20, face = "bold"),
+      axis.title.x = element_text(size = 18),
+      axis.title.y = element_text(size = 18),
+      axis.text = element_text(size = 14),
+      legend.text = element_text(size = 14),
+      legend.title = element_text(size = 16)
+    )
+
+  return(p)
+}
+
+# Generate and store volcano plots for each subtype in de_results_subtype_list
+volcano_plots <- lapply(names(de_results_subtype_list), function(subtype) {
+  de_results <- de_results_subtype_list[[subtype]]
+  create_volcano_plot(de_results, subtype)
+})
+
+# Optionally, set names to the list of plots
+names(volcano_plots) <- names(de_results_subtype_list)
+
+volcano_plots
+
+```
+
+### Saving D vs R persubtype
+
+```{r}
+# Define the directory to save the Task 2 volcano plots
+output_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Integrated_D_R_curtis/tasks_results/task2_DvsR_per_subtype"
+
+# Save each volcano plot with a specified filename
+lapply(names(volcano_plots), function(subtype) {
+  # Get the plot for the given subtype
+  plot <- volcano_plots[[subtype]]
+  
+  # Create the file name with format "D_vs_R_<subtype>_0.5padj.png"
+  file_name <- paste0("D_vs_R_", subtype, "_0.316padj.png") 
+  
+  # Save the plot using ggsave with full HD settings and white background
+  ggsave(filename = file.path(output_dir, file_name), 
+         plot = plot, 
+         width = 16, height = 9, dpi = 300, bg = "white")
+})
+
+```
+
+### Trying upset plot
+
+```{r}
+# Function to identify significant genes based on updated thresholds
+get_significant_genes <- function(de_results, padj_threshold = 0.316, log2FC_threshold = 1.5) {
+  # Filter the significant genes and get their row names
+  significant_genes <- de_results %>%
+    filter(padj < padj_threshold & abs(log2FoldChange) >= log2FC_threshold) %>%
+    rownames()  # Get the row names as the gene names
+  return(significant_genes)
+}
+
+# Create a list of significant genes for each subtype using the updated thresholds
+significant_genes_list <- lapply(de_results_subtype_list, get_significant_genes)
+
+# Prepare the data for the UpSet plot
+all_genes <- unique(unlist(significant_genes_list))
+upset_data <- data.frame(
+  Gene = all_genes,
+  ETV = as.integer(all_genes %in% significant_genes_list$ETV),
+  LH = as.integer(all_genes %in% significant_genes_list$LH),
+  NH = as.integer(all_genes %in% significant_genes_list$NH),
+  PH = as.integer(all_genes %in% significant_genes_list$PH)
+)
+
+# Remove the Gene column for plotting
+upset_data <- upset_data %>%dplyr::select(-Gene)
+
+# Define the directory to save the Task 2 UpSet plot
+output_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Integrated_D_R_curtis/tasks_results/task2_DvsR_per_subtype"
+
+# Save the UpSet plot with the updated thresholds in the filename
+output_file <- file.path(output_dir, "UpSetPlot_DvsR_0.316padj_1.5FC.png")
+
+# Create and save the UpSet plot
+png(filename = output_file, width = 16, height = 9, units = "in", res = 300)
+upset(upset_data, sets = c("ETV", "LH", "NH", "PH"), order.by = "freq", 
+      mainbar.y.label = "Intersection Size", sets.x.label = "Set Size")
+dev.off()
+
+
+```
+
+```{r, fig.height= 10}
+# Step 1: Extract the top 20 significant genes from the ETV results, ordered by adjusted p-value
+top20_sig_genes <- de_results_subtype_list$ETV %>%
+  arrange(padj) %>%
+  head(n = 20) %>%
+  rownames()
+
+# Step 2: Extract expression values for these genes from the filtered pseudobulk matrix
+# Subset the matrix to include only the top 20 significant genes
+top20_sig_counts <- filtered_bulk_matrix[rownames(filtered_bulk_matrix) %in% top20_sig_genes, ]
+
+# Step 3: Convert the matrix to long format for ggplot2
+top20_sig_df <- as.data.frame(top20_sig_counts)
+top20_sig_df$gene <- rownames(top20_sig_df)
+
+# Melt the data into long format using reshape2::melt
+top20_sig_df <- melt(top20_sig_df, id.vars = "gene", variable.name = "sample", value.name = "expression")
+
+# Step 4: Merge with metadata to get 'condition' (Diagnosis/Relapse) and subtype information
+top20_sig_df <- merge(top20_sig_df, meta_data, by.x = "sample", by.y = "sample")
+
+# Step 5: Generate the violin plot with ggplot2
+ggplot(top20_sig_df, aes(x = condition, y = expression, fill = condition)) +
+  geom_violin(trim = FALSE) +  # Draw the violin plots
+  geom_jitter(shape = 16, position = position_jitter(0.2), size = 1, color = "black", alpha = 0.6) +  # Add individual points
+  facet_wrap(~ gene, scales = "free_y") +  # Separate each gene into its own panel
+  scale_y_continuous(trans = 'log10') +  # Use log scale for the y-axis
+  labs(title = "Top 20 Significant DE Genes for ETV",
+       y = "log10 of expression level",
+       x = "Condition (Diagnosis vs Relapse)") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 20),  # Increase title text size
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 12),  # Increase x-axis text size
+    axis.text.y = element_text(size = 12),  # Increase y-axis text size
+    axis.title = element_text(size = 14),  # Increase axis titles size
+    strip.background = element_rect(fill = "grey80", color = NA),  # Set grey background for gene names
+    strip.text = element_text(color = "black", face = "bold", size = 14)  # Increase gene labels text size
+  ) +
+  scale_fill_manual(values = c("Diagnosis" = "#ffad73", "Relapse" = "#26b3ff"))  # Customize color scheme
+
+```
+
+##### Here make a volcano plot with a fc of 1.5
+
+#### D vs D by Subtype
+
+One pca only of Ds and also FindMarkers
+
+```{r}
+# Add subtype column to meta_data based on sample names
+meta_data$subtype <- ifelse(grepl("PH", meta_data$sample), "PH", 
+                            ifelse(grepl("ETV", meta_data$sample), "ETV",
+                                   ifelse(grepl("LH", meta_data$sample), "LH", "NH")))
+
+# Filter the metadata to only include Diagnosis samples
+diagnosis_meta_data <- meta_data[meta_data$condition == "Diagnosis", ]
+```
+
+```{r}
+# List of subtypes (for Diagnosis samples only)
+diagnosis_subtypes <- unique(diagnosis_meta_data$subtype)
+# Filter the bulk matrix to only include Diagnosis samples
+diagnosis_bulk_matrix <- filtered_bulk_matrix[, diagnosis_meta_data$sample]
+
+# Step 1: Create the SummarizedExperiment object for all Diagnosis samples
+diagnosis_se <- SummarizedExperiment(
+  assays = list(counts = as.matrix(diagnosis_bulk_matrix)),
+  colData = diagnosis_meta_data
+)
+
+# Step 2: QC - Filter out low abundant genes and scale the abundance
+counts_scaled <- diagnosis_se %>%
+  keep_abundant(factor_of_interest = condition) %>%
+  scale_abundance()
+
+# Step 3: Perform PCA on the combined Diagnosis samples
+counts_scal_PCA <- counts_scaled %>%
+  reduce_dimensions(method = "PCA", .dims = 3)
+
+# Step 4: Plot the PCA results, color-coding by subtype
+pca_plot <- counts_scal_PCA %>%
+  pivot_sample() %>%
+  ggplot(aes(x = PC1, y = PC2, colour = subtype)) +
+  geom_point() +
+  geom_text_repel(aes(label = .sample), show.legend = FALSE, size = 3) +
+  labs(title = "PCA for All Diagnosis Samples",
+       x = "PC1", y = "PC2") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+# Step 5: Print the PCA plot
+print(pca_plot)
+
+```
+
+```{r}
+# Initialize an empty list to store DE results for Diagnosis comparisons between subtypes
+de_results_subtype_diagnosis_list <- list()
+
+# Define pairs of subtypes to compare, e.g., ETV vs LH Diagnosis
+subtype_comparison_pairs <- list(c("ETV", "LH"), c("ETV", "NH"), c("LH", "NH"), c("PH", "ETV"), c("PH", "LH"))
+
+# Loop through each pair of subtypes to perform DE analysis for Diagnosis samples
+for (pair in subtype_comparison_pairs) {
+  subtype1 <- pair[1]
+  subtype2 <- pair[2]
+  
+  # Subset the metadata for the two subtypes
+  subtype1_meta_data <- diagnosis_meta_data[diagnosis_meta_data$subtype == subtype1, ]
+  subtype2_meta_data <- diagnosis_meta_data[diagnosis_meta_data$subtype == subtype2, ]
+  
+  # Combine the metadata for the two subtypes
+  combined_meta_data <- rbind(subtype1_meta_data, subtype2_meta_data)
+  
+  # Subset the bulk matrix for the two subtypes
+  combined_bulk_matrix <- filtered_bulk_matrix[, combined_meta_data$sample]
+  
+  # Create a DESeq2 dataset
+  dds <- DESeqDataSetFromMatrix(
+    countData = combined_bulk_matrix,
+    colData = combined_meta_data,
+    design = ~ subtype  # Compare subtypes instead of condition
+  )
+  
+  # Run DESeq2 analysis
+  dds <- DESeq(dds)
+  
+  # Extract results, order by adjusted p-value
+  de_results <- results(dds, contrast = c("subtype", subtype1, subtype2), alpha = 0.05) %>%
+    as.data.frame() %>%
+    arrange(padj)
+  
+  # Store the DE results in the list
+  comparison_name <- paste0(subtype1, "_vs_", subtype2)
+  de_results_subtype_diagnosis_list[[comparison_name]] <- de_results
+}
+
+# Example: Check DE results for a specific comparison (e.g., ETV vs LH)
+head(de_results_subtype_diagnosis_list$ETV_vs_LH)
+
+```
+
+## PERSONAL TRYING
+
+```{r}
+lh_meta_data <- meta_data[meta_data$subtype == "LH", ]
+lh_bulk_matrix <- filtered_bulk_matrix[, lh_meta_data$sample]
+```
+
+```{r}
+lh_dds <- DESeqDataSetFromMatrix(
+  countData = lh_bulk_matrix,
+  colData = lh_meta_data,
+  design = ~ condition
+)
+lh_dds <- DESeq(lh_dds)
+lh_de_results <- results(lh_dds, alpha = 0.05) %>%
+  as.data.frame() %>%
+  arrange(padj)
+
+```
+```{r}
+downregulated_genes <- lh_de_results %>%
+  filter(log2FoldChange < 0 & padj < 0.316) %>%
+  rownames()
+```
+```{r, fig.height=10, fig.width=10}
+library(clusterProfiler)
+go_results <- enrichGO(gene = downregulated_genes,
+                       OrgDb = org.Hs.eg.db,
+                       keyType = "SYMBOL",
+                       ont = "BP", # Biological Process
+                       pvalueCutoff = 0.316)
+barplot(go_results, showCategory = 10, title = "Top GO Terms for Downregulated Genes")
+
+```
+
+```{r}
+# Assuming you have a data frame `lh_de_results` with gene expression results
+# Filter and rank genes
+ranked_genes <- lh_de_results %>%
+  rownames_to_column("Gene") %>% 
+  dplyr::select(Gene, log2FoldChange) %>%
+  arrange(desc(log2FoldChange))
+
+# Create a named vector of ranked genes
+gene_ranks <- ranked_genes %>%
+  deframe()
+
+# Break ties in ranked genes by adding small random noise
+set.seed(123)  # For reproducibility
+gene_ranks <- gene_ranks + rnorm(length(gene_ranks), mean = 0, sd = 1e-5)
+```
+
+```{r}
+
+# Retrieve Hallmark gene sets for Homo sapiens
+hallmark_pathways <- msigdbr(species = "Homo sapiens", category = "H")
+
+# Format pathways for fgsea
+hallmark_pathway_list <- hallmark_pathways %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+```
+
+```{r}
+# Remove non-finite values
+gene_ranks <- gene_ranks[is.finite(gene_ranks)]
+
+# Alternatively, replace non-finite values with zero
+# gene_ranks[!is.finite(gene_ranks)] <- 0
+
+# Run fgseaMultilevel for better precision
+fgsea_results <- fgsea(
+  pathways = hallmark_pathway_list,
+  stats = gene_ranks,
+  minSize = 15,
+  maxSize = 500,
+  eps = 0  # Increases precision for very small p-values
+)
+```
+
+```{r}
+# Convert results to a tidy tibble and filter significant pathways
+fgsea_tidy <- fgsea_results %>%
+  as_tibble() %>%
+  arrange(padj)
+
+significant_pathways <- fgsea_tidy %>%
+  filter(padj < 0.316)
+```
+```{r}
+# Bar plot of top 20 significant pathways by NES
+fgsea_tidy %>%
+  filter(NES < 0) %>%          # Filter significant pathways
+  slice_min(padj, n = 20) %>%     # Select top 20 pathways by adjusted p-value
+  ggplot(aes(x = reorder(pathway, NES), y = NES, fill = NES > 0)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Top Enriched Hallmark Pathways",
+    x = "Pathway",
+    y = "Normalized Enrichment Score (NES)"
+  ) +
+  scale_fill_manual(values = c("TRUE" = "#61BB6F", "FALSE" = "#EC7012")) +
+  theme_minimal()
+```
+
+## Figure 2 producing
+
+```{r}
+
+```
+
+
+
+# Task 3 Volcano plot D within each subtype
+
+```{r}
+# Define colors, sizes, and alphas for the volcano plot
+cols <- c("up" = "#ffad73", "down" = "#26b3ff", "ns" = "grey")
+sizes <- c("up" = 2, "down" = 2, "ns" = 1)
+alphas <- c("up" = 1, "down" = 1, "ns" = 0.5)
+```
+
+```{r}
+# Function to create a volcano plot with updated thresholds for Task 3
+create_volcano_plot_diagnosis <- function(de_results, comparison_name) {
+  # Prepare data for the volcano plot
+  volcano_data <- de_results %>%
+    rownames_to_column(var = "GeneSymbol") %>% 
+    drop_na() %>%
+    mutate(FoldChange = 2^log2FoldChange) %>%
+    mutate(GeneType = case_when(
+      FoldChange >= 1.5 & padj <= 0.316 ~ "up",  # Update the padj threshold to 0.316
+      FoldChange <= (1/1.5) & padj <= 0.316 ~ "down",
+      TRUE ~ "ns"
+    ))
+
+  # Create the volcano plot
+  p <- ggplot(volcano_data, aes(x = log2(FoldChange), y = -log10(padj), 
+                                fill = GeneType, 
+                                size = GeneType, 
+                                alpha = GeneType)) +
+    geom_point(shape = 21, colour = "black") +
+    geom_hline(yintercept = -log10(0.316), linetype = "dashed") +  # Update the y-intercept to -log10(0.316)
+    geom_vline(xintercept = c(log2(1/1.5), log2(1.5)), linetype = "dashed") +
+    scale_fill_manual(values = cols) +
+    scale_size_manual(values = sizes) +
+    scale_alpha_manual(values = alphas) +
+    geom_text_repel(
+      data = filter(volcano_data, padj < 0.316 & abs(log2(FoldChange)) >= log2(1.5)),  # Update the filtering for the labels
+      aes(x = log2(FoldChange), y = -log10(padj), label = GeneSymbol),
+      size = 5,  
+      color = "darkblue",
+      max.overlaps = 0.5,
+      box.padding = 0.5,
+      min.segment.length = Inf,
+      inherit.aes = FALSE
+    ) +
+    labs(title = paste("Volcano Plot for", comparison_name, "with 0.316 adjpval"),
+         x = "Log2 Fold Change",
+         y = "-Log10 Adjusted P-Value") +
+    theme_minimal(base_family = "Arial") +
+    theme(
+      panel.background = element_rect(fill = "white", colour = NA),
+      plot.background = element_rect(fill = "white", colour = NA),
+      legend.position = "bottom",
+      plot.title = element_text(size = 20, face = "bold"),
+      axis.title.x = element_text(size = 18),
+      axis.title.y = element_text(size = 18),
+      axis.text = element_text(size = 14),
+      legend.text = element_text(size = 14),
+      legend.title = element_text(size = 16)
+    )
+
+  return(p)
+}
+
+# Generate and store volcano plots for each subtype comparison in de_results_subtype_diagnosis_list
+volcano_plots_diagnosis <- lapply(names(de_results_subtype_diagnosis_list), function(comparison_name) {
+  de_results <- de_results_subtype_diagnosis_list[[comparison_name]]
+  create_volcano_plot_diagnosis(de_results, comparison_name)
+})
+
+# Optionally, set names to the list of plots
+names(volcano_plots_diagnosis) <- names(de_results_subtype_diagnosis_list)
+
+volcano_plots_diagnosis
+
+
+```
+
+Saving them
+
+```{r}
+# Define the directory to save the plots
+output_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Integrated_D_R_curtis/tasks_results/task3_all_Ds_per_subtpye"
+
+# Save each volcano plot with a specified filename
+lapply(names(volcano_plots_diagnosis), function(comparison_name) {
+  # Get the plot
+  plot <- volcano_plots_diagnosis[[comparison_name]]
+  
+  # Create the file name with format "D_<comparison_name>_0.5padj.png"
+  file_name <- paste0("D_", comparison_name, "_0.316padj.png")
+  
+  # Save the plot using ggsave with full HD settings and white background
+  ggsave(filename = file.path(output_dir, file_name), 
+         plot = plot, 
+         width = 16, height = 9, dpi = 300, bg = "white")
+})
+```
+
+## Trying the heatmap
+
+```{r}
+# Step 1: Filter the bulk matrix to keep only diagnosis samples
+diagnosis_samples <- meta_data %>%
+  filter(condition == "Diagnosis") %>%
+  pull(sample)
+
+diagnosis_matrix <- filtered_bulk_matrix[, diagnosis_samples, drop = FALSE]
+
+# Step 2: Create an empty list to store the columns for each subtype with averages
+extended_matrix <- as.data.frame(diagnosis_matrix)  # Start with the filtered matrix
+
+# 1. Filter for ETV subtype columns
+etv_matrix <- extended_matrix %>%dplyr::select(starts_with("ETV"))
+
+# 2. Filter for LH subtype columns
+lh_matrix <- extended_matrix %>%dplyr::select(starts_with("LH"))
+
+# 3. Filter for NH subtype columns
+nh_matrix <- extended_matrix %>%dplyr::select(starts_with("NH"))
+
+# 4. Filter for PH subtype columns
+ph_matrix <- extended_matrix %>%dplyr::select(starts_with("PH"))
+
+# Display structure to confirm
+str(etv_matrix)
+str(lh_matrix)
+str(nh_matrix)
+str(ph_matrix)
+```
+## Trying only for ETV
+
+```{r}
+# List of matrices and their respective average column names
+matrices <- list(ETV = etv_matrix, LH = lh_matrix, NH = nh_matrix, PH = ph_matrix)
+average_col_names <- c("ETV_avg", "LH_avg", "NH_avg", "PH_avg")
+
+# Function to add average column to each matrix
+add_avg_column <- function(matrix, avg_col_name, prefix) {
+  matrix %>%
+    dplyr::mutate(!!avg_col_name := rowMeans(dplyr::select(., starts_with(prefix)), na.rm = TRUE))
+}
+
+# Apply the function and assign each output to a separate variable
+etv_matrix <- add_avg_column(etv_matrix, "ETV_avg", "ETV")
+lh_matrix <- add_avg_column(lh_matrix, "LH_avg", "LH")
+nh_matrix <- add_avg_column(nh_matrix, "NH_avg", "NH")
+ph_matrix <- add_avg_column(ph_matrix, "PH_avg", "PH")
+
+# Check structures to confirm each data frame has the new column
+str(etv_matrix)
+str(lh_matrix)
+str(nh_matrix)
+str(ph_matrix)
+```
+
+## Merging
+
+```{r}
+# Extract only the average columns from each matrix and rename them to subtype names
+etv_avg <- etv_matrix %>% dplyr::select(ETV_avg)
+lh_avg <- lh_matrix %>% dplyr::select(LH_avg)
+nh_avg <- nh_matrix %>% dplyr::select(NH_avg)
+ph_avg <- ph_matrix %>% dplyr::select(PH_avg)
+
+# Combine the average columns into a single data frame, keeping row names intact
+combined_avg_expression <- data.frame(
+  ETV = etv_avg$ETV_avg,
+  LH = lh_avg$LH_avg,
+  NH = nh_avg$NH_avg,
+  PH = ph_avg$PH_avg,
+  row.names = rownames(etv_matrix)
+)
+
+# Check the structure to confirm the combined format
+str(combined_avg_expression)
+
+```
+
+
+
+```{r, fig.height=25}
+# Z-score normalization of each gene across the subtypes
+zscore_matrix <- t(apply(combined_avg_expression, 1, function(x) (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)))
+
+# Calculate the variance of each gene across subtypes
+gene_variances <- apply(zscore_matrix, 1, var, na.rm = TRUE)
+
+# Get the names of the top 100 most variable genes
+top_100_genes <- names(sort(gene_variances, decreasing = TRUE))[1:500]
+
+# Subset the z-score matrix to include only the top 100 genes
+top_100_zscore_matrix <- zscore_matrix[top_100_genes, ]
+
+# Plot the heatmap with the top 100 most variable genes
+pheatmap(
+  top_100_zscore_matrix,
+  cluster_rows = T,            # Cluster genes by their z-score patterns
+  cluster_cols = F,            # Cluster subtypes
+  main = "Top 50 Most Variable Genes (Z-Score Normalized) Across Subtypes",
+  show_rownames = F,           # Show gene names for clarity
+  show_colnames = TRUE,           # Show subtype labels
+  color = colorRampPalette(c("blue", "white", "red"))(50), # Blue = low, Red = high
+  fontsize_col = 35,
+  fontsize_row = 35,
+  fontsize = 35
+)
+```
+
+
+
+# Producing figure 1 part 1
+
+```{r}
+# Z-score normalization of each gene across the subtypes
+zscore_matrix <- t(apply(combined_avg_expression, 1, function(x) (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)))
+
+# Calculate the variance of each gene across subtypes
+gene_variances <- apply(zscore_matrix, 1, var, na.rm = TRUE)
+
+# Get the names of the top 1000 most variable genes
+top_1000_genes <- names(sort(gene_variances, decreasing = TRUE))[1:1000]
+
+# Subset the z-score matrix to include only the top 1000 genes
+top_1000_zscore_matrix <- zscore_matrix[top_1000_genes, ]
+
+# Rank by LH and NH Z-scores
+ranked_by_LH <- top_1000_zscore_matrix[order(-top_1000_zscore_matrix[, "LH"]), ]
+ranked_by_NH <- top_1000_zscore_matrix[order(-top_1000_zscore_matrix[, "NH"]), ]
+
+
+# Create the directory if it doesn't exist
+output_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Integrated_D_R_curtis/tasks_results/figure_1"
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+# Function to save pheatmap as SVG
+save_pheatmap_svg <- function(pheatmap_obj, filename) {
+  svg(filename)
+  grid::grid.draw(pheatmap_obj$gtable)
+  dev.off()
+}
+
+# Plot heatmap ranked by LH and save as SVG
+p1 <- pheatmap::pheatmap(
+  ranked_by_LH,
+  cluster_rows = FALSE,  # Do not cluster rows to preserve ranking order
+  cluster_cols = FALSE,  # Do not cluster columns
+  main = "Top 1000 Variable Genes at Diagnosis Ranked by LH Z-Score (Single-Cell)",
+  show_rownames = FALSE, # Hide gene names for clarity
+  show_colnames = TRUE,  # Show subtype labels
+  color = colorRampPalette(c("blue", "white", "red"))(50), # Color scheme
+  fontsize_col = 10,
+  fontsize_row = 10
+)
+save_pheatmap_svg(p1, file.path(output_dir, "sc_top1000_LHranked.svg"))
+
+# Plot heatmap ranked by NH and save as SVG
+p2 <- pheatmap::pheatmap(
+  ranked_by_NH,
+  cluster_rows = FALSE,  # Do not cluster rows to preserve ranking order
+  cluster_cols = FALSE,  # Do not cluster columns
+  main = "Top 1000 Variable Genes at Diagnosis Ranked by NH Z-Score (Single-Cell)",
+  show_rownames = FALSE, # Hide gene names for clarity
+  show_colnames = TRUE,  # Show subtype labels
+  color = colorRampPalette(c("blue", "white", "red"))(50), # Color scheme
+  fontsize_col = 10,
+  fontsize_row = 10
+)
+save_pheatmap_svg(p2, file.path(output_dir, "sc_top1000_NHranked.svg"))
+
+
+
+
+```
+
+### Loking for KIF9
+
+```{r}
+# Z-score normalization of each gene across the subtypes
+zscore_matrix <- t(apply(combined_avg_expression, 1, function(x) (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)))
+
+# Calculate the variance of each gene across subtypes
+gene_variances <- apply(zscore_matrix, 1, var, na.rm = TRUE)
+
+# Get the names of the top 500 most variable genes
+top_500_genes <- names(sort(gene_variances, decreasing = TRUE))[1:500]
+
+# Subset the z-score matrix to include only the top 500 genes
+top_500_zscore_matrix <- zscore_matrix[top_500_genes, ]
+
+# Filter the matrix to include only the row for gene "KIF9"
+kif9_data <- zscore_matrix["KIF9", , drop = FALSE]
+
+# Plot the heatmap for the gene "KIF9"
+pheatmap::pheatmap(
+  kif9_data,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  main = "Heatmap for gene KIF9 on Diagnosis single cell",
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  color = colorRampPalette(c("blue", "white", "red"))(50),
+  fontsize_col = 10,
+  fontsize_row = 10,
+  cellheight = 25
+)
+```
+## combined relapse avg exprs
+
+```{r}
+# Step 1: Filter the bulk matrix to keep only relapse samples
+relapse_samples <- meta_data %>%
+  filter(condition == "Relapse") %>%
+  pull(sample)
+
+relapse_matrix <- filtered_bulk_matrix[, relapse_samples, drop = FALSE]
+
+# Step 2: Create an empty list to store the columns for each subtype with averages
+relapse_extended_matrix <- as.data.frame(relapse_matrix)  # Start with the filtered matrix
+
+# 1. Filter for ETV subtype columns
+relapse_etv_matrix <- relapse_extended_matrix %>% dplyr::select(starts_with("ETV"))
+
+# 2. Filter for LH subtype columns
+relapse_lh_matrix <- relapse_extended_matrix %>% dplyr::select(starts_with("LH"))
+
+# 3. Filter for NH subtype columns
+relapse_nh_matrix <- relapse_extended_matrix %>% dplyr::select(starts_with("NH"))
+
+# 4. Filter for PH subtype columns
+relapse_ph_matrix <- relapse_extended_matrix %>% dplyr::select(starts_with("PH"))
+
+# List of matrices and their respective average column names
+relapse_matrices <- list(ETV = relapse_etv_matrix, LH = relapse_lh_matrix, NH = relapse_nh_matrix, PH = relapse_ph_matrix)
+relapse_average_col_names <- c("ETV_avg", "LH_avg", "NH_avg", "PH_avg")
+
+# Function to add average column to each matrix
+add_avg_column <- function(matrix, avg_col_name, prefix) {
+  matrix %>%
+    dplyr::mutate(!!avg_col_name := rowMeans(dplyr::select(., starts_with(prefix)), na.rm = TRUE))
+}
+
+# Apply the function and assign each output to a separate variable
+relapse_etv_matrix <- add_avg_column(relapse_etv_matrix, "ETV_avg", "ETV")
+relapse_lh_matrix <- add_avg_column(relapse_lh_matrix, "LH_avg", "LH")
+relapse_nh_matrix <- add_avg_column(relapse_nh_matrix, "NH_avg", "NH")
+relapse_ph_matrix <- add_avg_column(relapse_ph_matrix, "PH_avg", "PH")
+
+# Extract only the average columns from each matrix and rename them to subtype names
+relapse_etv_avg <- relapse_etv_matrix %>% dplyr::select(ETV_avg)
+relapse_lh_avg <- relapse_lh_matrix %>% dplyr::select(LH_avg)
+relapse_nh_avg <- relapse_nh_matrix %>% dplyr::select(NH_avg)
+relapse_ph_avg <- relapse_ph_matrix %>% dplyr::select(PH_avg)
+
+# Combine the average columns into a single data frame, keeping row names intact
+relapse_combined_avg_expression <- data.frame(
+  ETV = relapse_etv_avg$ETV_avg,
+  LH = relapse_lh_avg$LH_avg,
+  NH = relapse_nh_avg$NH_avg,
+  PH = relapse_ph_avg$PH_avg,
+  row.names = rownames(relapse_etv_matrix)
+)
+
+# Check the structure to confirm the combined format
+str(relapse_combined_avg_expression)
+
+# Z-score normalization of each gene across the subtypes
+relapse_zscore_matrix <- t(apply(relapse_combined_avg_expression, 1, function(x) (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)))
+
+# Calculate the variance of each gene across subtypes
+relapse_gene_variances <- apply(relapse_zscore_matrix, 1, var, na.rm = TRUE)
+
+# Get the names of the top 500 most variable genes
+relapse_top_500_genes <- names(sort(relapse_gene_variances, decreasing = TRUE))[1:500]
+
+# Subset the z-score matrix to include only the top 500 genes
+relapse_top_500_zscore_matrix <- relapse_zscore_matrix[relapse_top_500_genes, ]
+
+# Filter the matrix to include only the row for gene "KIF9"
+relapse_kif9_data <- relapse_zscore_matrix["GEM", , drop = FALSE]
+
+# Plot the heatmap for the gene "KIF9"
+pheatmap::pheatmap(
+  relapse_kif9_data,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  main = "Heatmap for gene KIF9 on Relapse single cell",
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  color = colorRampPalette(c("blue", "white", "red"))(50),
+  fontsize_col = 10,
+  fontsize_row = 10,
+  cellheight = 25
+)
+```
+
+
+# Task 4 Average Expression of StJudes Data
+
+## Trying StJudes data
+
+### Reading sample names
+
+```{r}
+patient_id <- readxl::read_excel("sample.subtype.pmid30643249.xlsx") %>% 
+  rename("subtype" = "primary subtype")
+```
+
+```{r}
+# Create a new column with transformed subtypes
+patient_id <- patient_id %>%
+  mutate(
+    primary_subtype = case_when(
+      subtype == "Ph-like" ~ "Ph",
+      subtype == "ETV6-RUNX1-like" ~ "ETV6-RUNX1",
+      subtype == "KMT2A-like" ~ "KMT2A",
+      subtype == "ZNF384-like" ~ "ZNF384",
+      TRUE ~ subtype  # Keep other subtypes as they are
+    )
+  )
+
+# Display unique values to confirm changes
+unique(patient_id$primary_subtype)
+```
+
+
+```{r}
+stjudes <- read.delim("merged.Log2-FPKM_UQ.txt")
+```
+
+```{r}
+# Load necessary library
+
+
+# Remove "_D" and "_D1" suffixes from column names in `stjudes`
+# Update `stjudes` column names to remove anything after the first underscore
+names(stjudes) <- sub("_.*", "", names(stjudes))
+
+
+stjudes_clean <- stjudes %>%
+  dplyr::select(-GeneID)
+
+# Step 2: Remove duplicate rows based on "Gene" column
+stjudes_clean <- stjudes_clean %>%
+  distinct(Gene, .keep_all = TRUE)
+
+# Step 3: Set "Gene" column as row names and remove it from data frame
+rownames(stjudes_clean) <- stjudes_clean$Gene
+stjudes_clean <- stjudes_clean %>%
+  dplyr::select(-Gene)
+
+
+```
+
+
+## Renaming
+
+```{r}
+rename_map <- patient_id %>%
+  dplyr::select(patient, primary_subtype) %>%
+  filter(patient %in% names(stjudes_clean))
+
+# Create a named vector for renaming columns
+rename_vector <- setNames(rename_map$primary_subtype, rename_map$patient)
+
+# Convert `stjudes` to a matrix to allow duplicate column names
+stjudes_matrix <- as.matrix(stjudes_clean)
+
+# Apply the renaming directly, allowing duplicate names in the matrix
+colnames(stjudes_matrix)[colnames(stjudes_matrix) %in% names(rename_vector)] <- rename_vector[colnames(stjudes_matrix)]
+
+# Check if it matches your expectations
+as.data.frame(head(stjudes_matrix))
+```
+
+
+## Doing the heatmap
+
+```{r}
+stjudes_df <- as.data.frame(stjudes_matrix)
+
+# Step 2: Repair column names by appending unique suffixes to duplicates
+colnames(stjudes_df) <- make.unique(colnames(stjudes_df), sep = "_")
+
+# Step 3: Add row names as a column using `rownames_to_column`
+stjudes_df <- stjudes_df %>% rownames_to_column("Gene")
+
+```
+
+
+
+```{r}
+# Define subtypes to process
+subtypes <- c("Ph", "Other", "ETV6-RUNX1", "PAX5alt", "Low hyperdiploid", "CRLF2(non-Ph-like)",
+              "HLF", "PAX5 P80R", "MEF2D", "TCF3-PBX1", "High hyperdiploid", "DUX4", 
+              "ZNF384", "KMT2A", "Near haploid", "iAMP21", "BCL2/MYC", "Low hypodiploid", 
+              "IKZF1 N159Y", "NUTM1")
+
+# Calculate average expression for each subtype
+average_expression_list <- list()
+
+for (subtype in subtypes) {
+  subtype_avg <- stjudes_df %>%
+    dplyr::select(Gene, contains(subtype)) %>%
+    dplyr::mutate(avg_expression = rowMeans(dplyr::select(., -Gene), na.rm = TRUE)) %>%
+    dplyr::select(Gene, avg_expression) %>%
+    rename(!!paste0(subtype, "_avg") := avg_expression)
+  
+  average_expression_list[[subtype]] <- subtype_avg
+}
+
+# Step 4: Combine the averages for each subtype into a single data frame
+stjudes_avg_expression <- Reduce(function(x, y) inner_join(x, y, by = "Gene"), average_expression_list)
+
+# Display the combined data frame to confirm the structure
+stjudes_avg_expression
+```
+
+## Plotting stjudes heatmap
+
+```{r}
+# Step 5: Z-score normalization across the averages
+sjzscore_matrix <- t(apply(stjudes_avg_expression[, -1], 1, function(x) (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)))
+
+# Step 6: Convert to a data frame and add gene names as row names
+sjzscore_df <- as.data.frame(sjzscore_matrix)
+rownames(sjzscore_df) <- stjudes_avg_expression$Gene
+
+# Step 7: Plot the heatmap using the top genes by variance (e.g., top 50 or 100)
+# Calculate variance and select top variable genes
+sjgene_variances <- apply(sjzscore_df, 1, var, na.rm = TRUE)
+sjtop_genes <- names(sort(sjgene_variances, decreasing = TRUE))[1:500]  # Adjust the number as needed
+
+# Subset the z-score matrix to include only the top variable genes
+sjtop_zscore_matrix <- sjzscore_df[sjtop_genes, ]
+
+# Step 8: Plot the heatmap
+pheatmap::pheatmap(
+  sjtop_zscore_matrix,
+  cluster_rows = T,  # Cluster genes based on Z-score patterns
+  cluster_cols = F, # Keep the order of subtypes
+  main = "Top 500 Variable Genes (Z-Score Normalized) of StJudes data Across Subtypes",
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  color = colorRampPalette(c("blue", "white", "red"))(50), # Adjust color palette if needed
+  fontsize_col = 9,
+  fontsize_row = 1
+)
+
+
+```
+## LH and NH
+
+```{r}
+# Convert Z-score matrix to a data frame if not already done
+sjzscore_df <- as.data.frame(sjzscore_matrix)
+rownames(sjzscore_df) <- stjudes_avg_expression$Gene
+
+# Rank by `Low Hypodiploid`
+ranked_low_hypodiploid <- sjzscore_df %>%
+  arrange(desc(`Low hypodiploid_avg`))
+
+# Rank by `Near Haploid`
+ranked_near_haploid <- sjzscore_df %>%
+  arrange(desc(`Near haploid_avg`))
+
+```
+
+
+### LH 
+
+```{r}
+# Select top 50 genes by variance from the ranked `Low Hypodiploid`
+top_genes_low_hypodiploid <- head(rownames(ranked_low_hypodiploid), 50)
+low_hypodiploid_zscore_matrix <- sjzscore_df[top_genes_low_hypodiploid, ]
+
+# Plot the heatmap
+pheatmap::pheatmap(
+  low_hypodiploid_zscore_matrix,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  main = "Top 50 Variable Genes Ranked by Low Hypodiploid Z-Score",
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  color = colorRampPalette(c("blue", "white", "red"))(50),
+  fontsize_col = 7,
+  fontsize_row = 9
+)
+
+```
+
+
+## NH
+
+```{r}
+# Select top 50 genes by variance from the ranked `Near Haploid`
+top_genes_near_haploid <- head(rownames(ranked_near_haploid), 50)
+near_haploid_zscore_matrix <- sjzscore_df[top_genes_near_haploid, ]
+
+# Plot the heatmap
+pheatmap::pheatmap(
+  near_haploid_zscore_matrix,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  main = "Top 50 Variable Genes Ranked by Near Haploid Z-Score",
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  color = colorRampPalette(c("blue", "white", "red"))(50),
+  fontsize_col = 7,
+  fontsize_row = 9
+)
+
+```
+
+
+```{r}
+# Calculate variance and select top 1000 variable genes in St. Jude data
+sjgene_variances <- apply(sjzscore_df, 1, var, na.rm = TRUE)
+sjtop_genes_1000 <- names(sort(sjgene_variances, decreasing = TRUE))[1:1000]
+
+# Subset the z-score matrix to include only the top 1000 genes
+sjtop_zscore_matrix_1000 <- sjzscore_df[sjtop_genes_1000, ]
+```
+
+
+```{r}
+# Rank the subset by `Low Hypodiploid`
+ranked_low_hypodiploid_1000 <- sjtop_zscore_matrix_1000 %>%
+  arrange(desc(`Low hypodiploid_avg`))
+
+# Plot heatmap for top 1000 genes ranked by Low Hypodiploid Z-score
+pheatmap::pheatmap(
+  ranked_low_hypodiploid_1000,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  main = "Top 1000 Variable Genes Ranked by Low Hypodiploid Z-Score",
+  show_rownames = FALSE,  # You may opt to hide row names for readability
+  show_colnames = TRUE,
+  color = colorRampPalette(c("blue", "white", "red"))(50),
+  fontsize_col = 6,
+  fontsize_row = 5
+)
+
+```
+
+```{r}
+# Rank the subset by `Near Haploid`
+ranked_near_haploid_1000 <- sjtop_zscore_matrix_1000 %>%
+  arrange(desc(`Near haploid_avg`))
+
+# Plot heatmap for top 1000 genes ranked by Near Haploid Z-score
+pheatmap::pheatmap(
+  ranked_near_haploid_1000,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  main = "Top 1000 Variable Genes Ranked by Near Haploid Z-Score",
+  show_rownames = FALSE,
+  show_colnames = TRUE,
+  color = colorRampPalette(c("blue", "white", "red"))(50),
+  fontsize_col = 6,
+  fontsize_row = 5
+)
+
+```
+
+```{r}
+# Export ranked data for Low Hypodiploid
+write.csv(ranked_low_hypodiploid_1000, "top_1000_genes_ranked_by_low_hypodiploid.csv", row.names = TRUE)
+
+# Export ranked data for Near Haploid
+write.csv(ranked_near_haploid_1000, "top_1000_genes_ranked_by_near_haploid.csv", row.names = TRUE)
+
+```
+
+
+### Producing figure 1 part 2
+
+```{r}
+# Create a new DataFrame with column names cleaned of '_avg'
+sjzscore_clean_df <- sjzscore_df
+colnames(sjzscore_clean_df) <- gsub("_avg$", "", colnames(sjzscore_clean_df))
+
+# Proceed with the original calculations and plots using the new DataFrame
+# Calculate variance and select top 1000 variable genes in the cleaned data
+sjgene_variances <- apply(sjzscore_clean_df, 1, var, na.rm = TRUE)
+sjtop_genes_1000 <- names(sort(sjgene_variances, decreasing = TRUE))[1:1000]
+
+# Subset the cleaned z-score matrix to include only the top 1000 genes
+sjtop_zscore_matrix_1000 <- sjzscore_clean_df[sjtop_genes_1000, ]
+
+# Rank the subset by `Low Hypodiploid`
+ranked_low_hypodiploid_1000 <- sjtop_zscore_matrix_1000 %>%
+  arrange(desc(`Low hypodiploid`))
+
+# Rank the subset by `Near Haploid`
+ranked_near_haploid_1000 <- sjtop_zscore_matrix_1000 %>%
+  arrange(desc(`Near haploid`))
+
+# Plot heatmap for top 1000 genes ranked by Low Hypodiploid Z-score
+pheatmap::pheatmap(
+  ranked_low_hypodiploid_1000,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  main = "Top 1000 Variable Genes Ranked by Low Hypodiploid Z-Score",
+  show_rownames = FALSE,  # You may opt to hide row names for readability
+  show_colnames = TRUE,
+  color = colorRampPalette(c("blue", "white", "red"))(50),
+  fontsize_col = 6,
+  fontsize_row = 5
+)
+
+
+
+# Plot heatmap for top 1000 genes ranked by Near Haploid Z-score
+pheatmap::pheatmap(
+  ranked_near_haploid_1000,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  main = "Top 1000 Variable Genes Ranked by Near Haploid Z-Score",
+  show_rownames = FALSE,
+  show_colnames = TRUE,
+  color = colorRampPalette(c("blue", "white", "red"))(50),
+  fontsize_col = 6,
+  fontsize_row = 5
+)
+
+# Create the directory if it doesn't exist
+output_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Integrated_D_R_curtis/tasks_results/figure_1"
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+# Function to save pheatmap as SVG
+save_pheatmap_svg <- function(pheatmap_obj, filename) {
+  svg(filename)
+  grid::grid.draw(pheatmap_obj$gtable)
+  dev.off()
+}
+
+# Plot heatmap for top 1000 genes ranked by Low Hypodiploid Z-score and save as SVG
+p1 <- pheatmap::pheatmap(
+  ranked_low_hypodiploid_1000,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  main = "Top 1000 Variable Genes StJude's Ranked by Low Hypodiploid Z-Score",
+  show_rownames = FALSE,  # You may opt to hide row names for readability
+  show_colnames = TRUE,
+  color = colorRampPalette(c("blue", "white", "red"))(50),
+  fontsize_col = 6,
+  fontsize_row = 5
+)
+save_pheatmap_svg(p1, file.path(output_dir, "stjudes_top1000_LowHypodiploidRanked.svg"))
+
+# Plot heatmap for top 1000 genes ranked by Near Haploid Z-score and save as SVG
+p2 <- pheatmap::pheatmap(
+  ranked_near_haploid_1000,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  main = "Top 1000 Variable Genes in StJude's Ranked by Near Haploid Z-Score",
+  show_rownames = FALSE,
+  show_colnames = TRUE,
+  color = colorRampPalette(c("blue", "white", "red"))(50),
+  fontsize_col = 6,
+  fontsize_row = 5
+)
+save_pheatmap_svg(p2, file.path(output_dir, "stjudes_top1000_NearHaploidRanked.svg"))
+
+```
+
+##### Task 4.2 scatterplot of GEM expression per patient
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+
+# Define the subtypes to keep
+subtypes <- c("Ph", "Other", "ETV6-RUNX1", "PAX5alt", "Low hyperdiploid", "CRLF2(non-Ph-like)",
+              "HLF", "PAX5 P80R", "MEF2D", "TCF3-PBX1", "High hyperdiploid", "DUX4", 
+              "ZNF384", "KMT2A", "Near haploid", "iAMP21", "BCL2/MYC", "Low hypodiploid", 
+              "IKZF1 N159Y", "NUTM1")
+
+# Subset the matrix to keep only the specified subtypes
+stjudes_subset <- stjudes_df %>%
+  dplyr::select(Gene, contains(subtypes))
+
+# Extract GEM gene expression
+gem_expression <- stjudes_subset %>%
+  filter(Gene == "GEM") %>%
+  pivot_longer(cols = -Gene, names_to = "Patient", values_to = "Expression")
+
+# Extract patient subtypes
+patient_subtypes <- patient_id %>%
+  dplyr::select(patient, primary_subtype) %>%
+  filter(patient %in% gem_expression$Patient)
+
+# Merge GEM expression with patient subtypes
+gem_expression <- gem_expression %>%
+  left_join(patient_subtypes, by = c("Patient" = "patient"))
+
+# Plot GEM gene expression with individual patients on the x-axis
+ggplot(gem_expression, aes(x = Patient, y = Expression, color = primary_subtype)) +
+  geom_jitter(width = 0.2) +
+  labs(title = "GEM Gene Expression by Patient",
+       x = "Patient",
+       y = "GEM Gene Expression (Log2 FPKM)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+
+# Step 1: Extract GEM gene expression
+gem_expression <- stjudes_df %>%
+  filter(Gene == "GEM") %>%  # Keep only the row for the GEM gene
+  pivot_longer(cols = -Gene, names_to = "patient", values_to = "GEM_expression")  # Reshape to long format
+
+# Step 2: Merge with patient_id to add primary_subtype
+gem_expression_with_subtype <- gem_expression %>%
+  left_join(patient_id, by = "patient")  # Merge with patient_id
+
+# Step 3: Extract subtype from patient IDs
+gem_expression_with_subtype <- gem_expression_with_subtype %>%
+  mutate(subtype = gsub("(_\\d+)$", "", patient))  # Remove suffixes like _1, _2, etc.
+
+# Step 4: Plot boxplots with scatterplot overlay
+ggplot(gem_expression_with_subtype, aes(x = subtype, y = GEM_expression, fill = subtype)) +
+  geom_boxplot(outlier.shape = NA) +  # Boxplot without outliers (we'll add them as dots)
+  geom_jitter(width = 0.2, alpha = 0.5, color = "black") +  # Add jittered points
+  labs(
+    title = "GEM Gene Expression by Subtype",
+    x = "Subtype",
+    y = "GEM Gene Expression (Log2 FPKM)"
+  ) +
+  theme_minimal() +
+ theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 0.5),
+        legend.position="none")
+
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+
+# Step 1: Extract GEM gene expression
+gem_expression <- stjudes_df %>%
+  filter(Gene == "GEM") %>%  # Keep only the row for the GEM gene
+  pivot_longer(cols = -Gene, names_to = "patient", values_to = "GEM_expression")  # Reshape to long format
+
+# Step 2: Merge with patient_id to add primary_subtype
+gem_expression_with_subtype <- gem_expression %>%
+  left_join(patient_id, by = "patient")  # Merge with patient_id
+
+# Step 3: Extract subtype from patient IDs
+gem_expression_with_subtype <- gem_expression_with_subtype %>%
+  mutate(subtype = gsub("(_\\d+)$", "", patient))  # Remove suffixes like _1, _2, etc.
+
+# Step 4: Calculate median GEM expression for each subtype
+subtype_medians <- gem_expression_with_subtype %>%
+  group_by(subtype) %>%
+  summarise(median_expression = median(GEM_expression, na.rm = TRUE)) %>%
+  arrange(desc(median_expression))  # Sort subtypes by median expression (highest to lowest)
+
+# Step 5: Reorder the subtype factor based on median expression
+gem_expression_with_subtype <- gem_expression_with_subtype %>%
+  mutate(subtype = factor(subtype, levels = subtype_medians$subtype))
+
+# Step 6: Plot boxplots with scatterplot overlay, ordered by median expression
+ggplot(gem_expression_with_subtype, aes(x = subtype, y = GEM_expression, fill = subtype)) +
+  geom_boxplot(outlier.shape = NA) +  # Boxplot without outliers (we'll add them as dots)
+  geom_jitter(width = 0.2, alpha = 0.5, color = "black") +  # Add jittered points
+  labs(
+    title = "GEM Gene Expression by Subtype (Ordered by Median Expression)",
+    x = "Subtype",
+    y = "GEM Gene Expression (Log2 FPKM)"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 0.5),
+    legend.position = "none"  # Remove legend
+  )
+```
+
+### Loop for different genes
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+
+# Define the list of genes
+genes_of_interest <- c("GEM", "INHBE", "RASL11A", "CYP7B1", "NFKBIE", "ZBTB10", "CTSB", "OLAH", "FAM76B")
+
+# Loop through each gene
+for (gene in genes_of_interest) {
+  
+  # Step 1: Extract gene expression
+  gene_expression <- stjudes_df %>%
+    filter(Gene == gene) %>%  # Keep only the row for the current gene
+    pivot_longer(cols = -Gene, names_to = "patient", values_to = "expression")  # Reshape to long format
+  
+  # Step 2: Merge with patient_id to add primary_subtype
+  gene_expression_with_subtype <- gene_expression %>%
+    left_join(patient_id, by = "patient")  # Merge with patient_id
+  
+  # Step 3: Extract subtype from patient IDs
+  gene_expression_with_subtype <- gene_expression_with_subtype %>%
+    mutate(subtype = gsub("(_\\d+)$", "", patient))  # Remove suffixes like _1, _2, etc.
+  
+  # Step 4: Calculate median expression for each subtype
+  subtype_medians <- gene_expression_with_subtype %>%
+    group_by(subtype) %>%
+    summarise(median_expression = median(expression, na.rm = TRUE)) %>%
+    arrange(median_expression)  # Sort subtypes by median expression in ASCENDING order
+  
+  # Step 5: Reorder the subtype factor based on median expression (ascending)
+  gene_expression_with_subtype <- gene_expression_with_subtype %>%
+    mutate(subtype = factor(subtype, levels = subtype_medians$subtype))
+  
+  # Step 6: Plot boxplots with scatterplot overlay, ordered by median expression
+  p <- ggplot(gene_expression_with_subtype, aes(x = subtype, y = expression, fill = subtype)) +
+    geom_boxplot(outlier.shape = NA) +  # Boxplot without outliers (we'll add them as dots)
+    geom_jitter(width = 0.2, alpha = 0.5, color = "black") +  # Add jittered points
+    labs(
+      title = paste0(gene, " Gene Expression by Subtype (Ordered by Median Expression)"),
+      x = "Subtype",
+      y = paste0(gene, " Gene Expression (Log2 FPKM)")
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),  # Adjust text angle and alignment
+      plot.margin = unit(c(1, 1, 1, 1.5), "cm"),  # Add margin to avoid text cutoff
+      legend.position = "none"  # Remove legend
+    )
+  
+  # Display the plot
+  print(p)
+  
+  ggsave(
+  filename = file.path("/Users/cojulian/Desktop/Tzu_projects/Matt/Integrated_D_R_curtis/tasks_results/median_plots", 
+                       paste0(gene, "_median_expression_stjude.png")),  # Full path to save location
+  plot = p,  # The plot to save
+  width = 12,  # Width of the plot (in inches)
+  height = 8,  # Height of the plot (in inches)
+  dpi = 600,  # High resolution (600 DPI)
+  bg = "white"  # Background color (optional, ensures white background)
+)
+}
+```
+
+
+LH
+NH
+
+in the slides
+mention what matt wanted to see both bulk and single cell, row and columnwise
+
+
+### Ascending meand or z-score
+
+```{r}
+gem_expression_with_subtype <- gem_expression_with_subtype %>%
+  group_by(subtype) %>% 
+  mutate(GEM_zscore = (GEM_expression - mean(GEM_expression, na.rm = TRUE)) /
+                        sd(GEM_expression, na.rm = TRUE)) %>%
+  ungroup()
+
+
+ggplot(gem_expression_with_subtype, aes(x = subtype, y = GEM_zscore, fill = subtype)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.5, color = "black") +
+  labs(
+    title = "GEM Gene Expression Z-Scores by Subtype",
+    x = "Subtype",
+    y = "GEM Gene Expression (Z-Score)"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 0.5),
+    legend.position = "none"
+  )
+
+```
+
+```{r}
+# Calculate median z-score for each subtype
+subtype_medians <- gem_expression_with_subtype %>%
+  group_by(subtype) %>%
+  summarise(median_z = median(GEM_zscore, na.rm = TRUE)) %>%
+  arrange(median_z)  # ascending order
+
+# Reorder the factor 'subtype' based on the ascending median z-score
+gem_expression_with_subtype <- gem_expression_with_subtype %>%
+  mutate(subtype = factor(subtype, levels = subtype_medians$subtype))
+
+# Plot the reordered data
+ggplot(gem_expression_with_subtype, aes(x = subtype, y = GEM_zscore, fill = subtype)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.5, color = "black") +
+  labs(
+    title = "GEM Gene Expression Z-Scores by Subtype (Ascending Order)",
+    x = "Subtype",
+    y = "GEM Gene Expression (Z-Score)"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 0.5),
+    legend.position = "none"
+  )
+```
+
+## Task 4.3.
+#### Trying it rowise
+
+##### Deprecated
+```{r}
+# z_scores <- stjudes_df %>%
+#   column_to_rownames("Gene") %>%
+#   as.matrix() %>%
+#   apply(1, function(x) if (sd(x, na.rm = TRUE) == 0) rep(NA, length(x)) else (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)) %>%
+#   t() %>%
+#   as.data.frame() %>%
+#   rownames_to_column("Gene")
+```
+
+```{r}
+
+# Update column names to replace "CRLF2(non-Ph-like)" with "CRLF2_nonPhlike"
+colnames(stjudes_df) <- gsub("CRLF2\\(non-Ph-like\\)", "CRLF2_nonPhlike", colnames(stjudes_df))
+
+# Verify the updated column names
+print(grep("CRLF2_nonPhlike", colnames(stjudes_df), value = TRUE))
+
+# Define subtypes to process
+subtypes <- c("Ph", "Other", "ETV6-RUNX1", "PAX5alt", "Low hyperdiploid", "CRLF2_nonPhlike",
+              "HLF", "PAX5 P80R", "MEF2D", "TCF3-PBX1", "High hyperdiploid", "DUX4", 
+              "ZNF384", "KMT2A", "Near haploid", "iAMP21", "BCL2/MYC", "Low hypodiploid", 
+              "IKZF1 N159Y", "NUTM1")
+
+# Calculate average expression for each subtype
+average_expression_list <- list()
+
+for (subtype in subtypes) {
+  # Select columns that match the subtype (including those with _1, _2, etc.)
+  subtype_cols <- grep(paste0("^", subtype, "(_\\d+)?$"), colnames(stjudes_df), value = TRUE)
+  
+  # Calculate the average expression for the subtype
+  subtype_avg <- stjudes_df %>%
+    dplyr::select(Gene, all_of(subtype_cols)) %>%
+    dplyr::mutate(avg_expression = rowMeans(dplyr::select(., -Gene), na.rm = TRUE)) %>%
+    dplyr::select(Gene, avg_expression) %>%
+    rename(!!paste0(subtype, "_avg") := avg_expression)
+  
+  # Add the result to the list
+  average_expression_list[[subtype]] <- subtype_avg
+}
+
+# Combine the averages for each subtype into a single data frame
+stjudes_avg_expression <- Reduce(function(x, y) inner_join(x, y, by = "Gene"), average_expression_list)
+
+# Check the result
+head(stjudes_avg_expression)
+names(stjudes_avg_expression)
+```
+### Step 2: Generate Z-Scores for Each Gene Across Subtypes
+
+
+```{r}
+# Step 2: Generate Z-scores for each gene across subtypes
+zscore_matrix <- stjudes_avg_expression %>%
+  column_to_rownames("Gene") %>%  # Set 'Gene' as row names
+  as.matrix() %>%  # Convert to a matrix
+  apply(1, function(x) {
+    if (sd(x, na.rm = TRUE) == 0) {
+      rep(NA, length(x))  # Handle genes with zero standard deviation
+    } else {
+      (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)  # Compute Z-score
+    }
+  }) %>%
+  t()  # Transpose back to original shape
+
+# Convert back to a dataframe and restore the 'Gene' column
+z_scores <- zscore_matrix %>%
+  as.data.frame() %>%
+  rownames_to_column("Gene")
+
+# Check the result
+head(z_scores)
+```
+
+### Step 3: Identify Genes with Z-Score > 2 for Both LH and NH
+
+```{r}
+# Step 3: Determine which genes have a Z-score > 2 for LH AND NH
+# Define LH and NH subtypes
+lh_subtype <- "Low hypodiploid_avg"  # Replace with the actual subtype name if different
+nh_subtype <- "Near haploid_avg"      # Replace with the actual subtype name if different
+
+# Filter genes with Z-score > 2 for both LH and NH
+genes_with_high_zscore <- z_scores %>%
+  filter(
+    !!sym(lh_subtype) > 2 &  # Z-score > 2 for LH
+    !!sym(nh_subtype) > 2    # Z-score > 2 for NH
+  )
+
+# Check the result
+genes_with_high_zscore
+```
+
+
+#### Heatmap of zscore filtered > 2
+
+```{r}
+# Set 'Gene' as row names and convert to a numeric matrix
+heatmap_data <- genes_with_high_zscore %>%
+  column_to_rownames("Gene") %>%
+  as.matrix()
+
+# Generate the heatmap
+pheatmap::pheatmap(
+  heatmap_data,
+  cluster_rows = T,       # Do not cluster rows (genes)
+  cluster_cols = T,       # Do not cluster columns (subtypes)
+  main = "Genes with High Z-Scores in StJude's Dataset",  # Heatmap title
+  show_rownames = TRUE,       # Show gene names (set to FALSE if too many genes)
+  show_colnames = TRUE,       # Show subtype names
+  color = colorRampPalette(c("blue", "white", "red"))(50),  # Color gradient
+  fontsize_col = 8,           # Font size for column names
+  fontsize_row = 6            # Font size for row names
+)
+```
+#### Now doing AND/OR and filtering
+
+### Step 3: Identify Genes with Z-Score > 2 for Both LH and NH
+
+```{r}
+# Step 3: Determine which genes have a Z-score > 2 for LH AND NH
+# Define LH and NH subtypes
+lh_subtype <- "Low hypodiploid_avg"  # Replace with the actual subtype name if different
+nh_subtype <- "Near haploid_avg"      # Replace with the actual subtype name if different
+
+# Filter genes with Z-score > 2 for both LH and NH
+genes_with_high_zscore <- z_scores %>%
+  filter(
+    !!sym(lh_subtype) > 2 &  # Z-score > 2 for LH
+    !!sym(nh_subtype) > 2    # Z-score > 2 for NH
+  )
+
+# Check the result
+genes_with_high_zscore
+```
+
+
+
+# REMOVING LOW EXPRESSING
+
+```{r}
+# Define subtypes
+subtypes <- c("Ph", "Other", "ETV6RUNX1", "PAX5alt", "Lowhyperdiploid", "CRLF2_nonPhlike",
+              "HLF", "PAX5P80R", "MEF2D", "TCF3PBX1", "Highhyperdiploid", "DUX4", 
+              "ZNF384", "KMT2A", "Nearhaploid", "iAMP21", "BCL2MYC", "Lowhypodiploid", 
+              "IKZF1N159Y", "NUTM1")
+
+# Function to check if a gene is expressed in a majority of a subtype's samples
+check_majority_positive <- function(expression_values) {
+  sum(expression_values > 0, na.rm = TRUE) > (length(expression_values) / 2)
+}
+
+# Step 1: Create a logical matrix indicating whether each gene is expressed per subtype
+subtype_expression_matrix <- sapply(subtypes, function(subtype) {
+  # Find matching columns for the subtype
+  subtype_cols <- grep(paste0("^", subtype, "(_\\d+)?$"), colnames(stjudes_df), value = TRUE)
+  
+  # Skip if no matching columns were found
+  if (length(subtype_cols) == 0) return(rep(FALSE, nrow(stjudes_df)))
+  
+  # Apply function to check majority expression for each gene
+  apply(stjudes_df[subtype_cols], 1, check_majority_positive)
+})
+
+# Step 2: Filter genes where at least one subtype has a majority positive expression
+filtered_stjudes_df <- stjudes_df[rowSums(subtype_expression_matrix) > 0, ]
+
+# Check results
+dim(filtered_stjudes_df)  # Should be fewer rows than the original dataset
+```
+
+#### Step 1: Compute Average Expression per Subtype in filtered_stjudes_df
+
+```{r}
+library(dplyr)
+
+# Update column names to replace "CRLF2(non-Ph-like)" with "CRLF2_nonPhlike"
+colnames(filtered_stjudes_df) <- gsub("CRLF2\\(non-Ph-like\\)", "CRLF2_nonPhlike", colnames(filtered_stjudes_df))
+
+# Verify the updated column names
+print(grep("CRLF2_nonPhlike", colnames(filtered_stjudes_df), value = TRUE))
+
+# Define subtypes to process
+subtypes <- c("Ph", "Other", "ETV6-RUNX1", "PAX5alt", "Low hyperdiploid", "CRLF2_nonPhlike",
+              "HLF", "PAX5 P80R", "MEF2D", "TCF3-PBX1", "High hyperdiploid", "DUX4", 
+              "ZNF384", "KMT2A", "Near haploid", "iAMP21", "BCL2/MYC", "Low hypodiploid", 
+              "IKZF1 N159Y", "NUTM1")
+
+# Calculate average expression for each subtype
+lowexp_filt_avg_expression_list <- list()
+
+for (subtype in subtypes) {
+  # Select columns that match the subtype (including those with _1, _2, etc.)
+  subtype_cols <- grep(paste0("^", subtype, "(_\\d+)?$"), colnames(filtered_stjudes_df), value = TRUE)
+  
+  # Calculate the average expression for the subtype
+  subtype_avg <- filtered_stjudes_df %>%
+    dplyr::select(Gene, all_of(subtype_cols)) %>%
+    dplyr::mutate(avg_expression = rowMeans(dplyr::select(., -Gene), na.rm = TRUE)) %>%
+    dplyr::select(Gene, avg_expression) %>%
+    rename(!!paste0(subtype, "_avg") := avg_expression)
+  
+  # Add the result to the list
+  lowexp_filt_avg_expression_list[[subtype]] <- subtype_avg
+}
+
+# Combine the averages for each subtype into a single data frame
+lowexp_filt_avg_expression <- Reduce(function(x, y) inner_join(x, y, by = "Gene"), lowexp_filt_avg_expression_list)
+
+# Check the result
+head(lowexp_filt_avg_expression)
+names(lowexp_filt_avg_expression)
+```
+
+#### 🔹 Step 2: Generate Z-Scores for Each Gene Across Subtypes
+
+```{r}
+library(tibble)  # Ensure tibble functions are available
+
+# Generate Z-scores for each gene across subtypes
+lowexp_filt_zscore_matrix <- lowexp_filt_avg_expression %>%
+  column_to_rownames("Gene") %>%  # Set 'Gene' as row names
+  as.matrix() %>%  # Convert to a matrix
+  apply(1, function(x) {
+    if (sd(x, na.rm = TRUE) == 0) {
+      rep(NA, length(x))  # Handle genes with zero standard deviation
+    } else {
+      (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)  # Compute Z-score
+    }
+  }) %>%
+  t()  # Transpose back to original shape
+
+# Convert back to a dataframe and restore the 'Gene' column
+lowexp_filt_z_scores <- lowexp_filt_zscore_matrix %>%
+  as.data.frame() %>%
+  rownames_to_column("Gene")
+
+# Check the result
+head(lowexp_filt_z_scores)
+
+```
+#### 🔹 Step 3: Identify Genes with Z-Score > 2 for Both LH and NH
+
+```{r}
+# Define LH and NH subtypes
+lh_subtype <- "Low hypodiploid_avg"  # Replace with actual subtype name if different
+nh_subtype <- "Near haploid_avg"      # Replace with actual subtype name if different
+
+# Filter genes with Z-score > 2 in either LH or NH (OR) as well as both (AND)
+lowexp_filt_genes_with_high_zscore <- lowexp_filt_z_scores %>%
+  filter(
+    (!!sym(lh_subtype) >= 2.5) |  # OR: Z-score > 2.5 for LH
+    (!!sym(nh_subtype) >= 2.5)    # OR: Z-score > 2.5 for NH
+  )
+
+# Check the result
+lowexp_filt_genes_with_high_zscore
+```
+
+##### Option 2: The 797 AND/OR genes in Z-score
+```{r}
+# Keep only genes that are in `lowexp_filt_genes_with_high_zscore`
+lowexp_filt_highzscore_log2fpkm <- lowexp_filt_avg_expression %>%
+  filter(Gene %in% lowexp_filt_genes_with_high_zscore$Gene)
+
+# Check dimensions (should match number of genes in `lowexp_filt_genes_with_high_zscore`)
+dim(lowexp_filt_highzscore_log2fpkm)
+
+# Save filtered log2FPKM dataframe
+#write.csv(lowexp_filt_highzscore_log2fpkm, "Filtered_HighZscore_Log2FPKM.csv", row.names = FALSE)
+
+```
+
+##### Option 2: The 797 AND/OR genes in Z-score
+
+```{r}
+# Keep genes where at least one subtype has log2FPKM >= 1
+lowexp_filt_highzscore_log2fpkm_filt <- lowexp_filt_highzscore_log2fpkm %>%
+  rowwise() %>%
+  filter(any(across(where(is.numeric), ~ .x >= 1))) %>%
+  ungroup()
+
+# Check dimensions (should be fewer than previous dataset)
+dim(lowexp_filt_highzscore_log2fpkm_filt)
+
+```
+
+```{r}
+library(pheatmap)
+
+# Set 'Gene' as row names and convert to a numeric matrix
+lowexp_filt_heatmap_data <- lowexp_filt_highzscore_log2fpkm_filt %>%
+  column_to_rownames("Gene") %>%
+  as.matrix()
+
+# Generate the heatmap
+pheatmap::pheatmap(
+  lowexp_filt_heatmap_data,
+  cluster_rows = T,       # Cluster rows (genes)
+  cluster_cols = T,       # Cluster columns (subtypes)
+  main = "Genes with High Z-Scores & log2FPKM ≥ 1 (Filtered for Low Expression) in log2FPKM",  # Heatmap title
+  show_rownames = TRUE,       # Show gene names (set to FALSE if too many genes)
+  show_colnames = TRUE,       # Show subtype names
+  color = colorRampPalette(c("blue", "white", "red"))(50),  # Color gradient
+  fontsize_col = 8,           # Font size for column names
+  fontsize_row = 6,
+  legend = TRUE,
+  legend_labels = c("title")# Font size for row names
+)
+
+```
+
+```{r}
+library(pheatmap)
+
+# Set 'Gene' as row names and convert to a numeric matrix
+lowexp_filt_heatmap_zscore_data <- lowexp_filt_genes_with_high_zscore %>%
+  column_to_rownames("Gene") %>%
+  as.matrix()
+
+# Generate the heatmap
+pheatmap::pheatmap(
+  lowexp_filt_heatmap_zscore_data,
+  cluster_rows = T,       # Cluster rows (genes)
+  cluster_cols = T,       # Cluster columns (subtypes)
+  main = "Genes with High Z-Scores (Filtered for Low Expression) in Z-Scores",  # Heatmap title
+  show_rownames = TRUE,       # Show gene names (set to FALSE if too many genes)
+  show_colnames = TRUE,       # Show subtype names
+  color = colorRampPalette(c("blue", "white", "red"))(50),  # Color gradient
+  fontsize_col = 8,           # Font size for column names
+  fontsize_row = 6
+  )
+
+```
+### Doing GSEA of 167 genes
+
+```{r}
+# Load required packages
+library(msigdbr)
+library(fgsea)
+library(dplyr)
+library(stringr)
+
+# Check available species in msigdbr (for Homo sapiens)
+msigdbr_show_species()
+
+# Retrieve Hallmark (H) and C6 Oncogenic pathways for Homo sapiens
+msigdbr_human_hallmarks <- msigdbr(species = "Homo sapiens", category = "H")
+msigdbr_human_oncogenic <- msigdbr(species = "Homo sapiens", category = "C6")
+
+```
+
+```{r}
+# Prepare Hallmark pathway list for fgsea
+fgsea_hallmark_sets <- msigdbr_human_hallmarks %>%
+  mutate(gs_name = str_remove(gs_name, "HALLMARK_")) %>%  # Remove prefix for readability
+  split(x = .$gene_symbol, f = .$gs_name)
+
+# Prepare C6 Oncogenic Signature pathway list for fgsea
+fgsea_oncogenic_sets <- msigdbr_human_oncogenic %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+```
+
+
+```{r}
+# Compute mean log2FPKM expression for each gene across all subtypes
+gene_ranks <- lowexp_filt_highzscore_log2fpkm_filt %>%
+  rowwise() %>%
+  mutate(mean_expression = mean(c_across(where(is.numeric)), na.rm = TRUE)) %>%
+  ungroup() %>%
+  dplyr::select(Gene, mean_expression) %>%
+  arrange(desc(mean_expression)) %>%  # Sort in descending order
+  deframe()  # Convert to named vector for fgsea
+
+```
+
+
+```{r}
+# Run GSEA for Hallmark pathways
+fgseaRes_hallmark <- fgsea(pathways = fgsea_hallmark_sets, stats = gene_ranks)
+
+# Run GSEA for C6 Oncogenic Signatures
+fgseaRes_oncogenic <- fgsea(pathways = fgsea_oncogenic_sets, stats = gene_ranks)
+
+```
+
+```{r}
+# Tidy up Hallmark GSEA results
+fgseaResTidy_hallmark <- fgseaRes_hallmark %>%
+  mutate(abbrev_pathway = abbreviate(pathway)) %>%
+  relocate(abbrev_pathway, .after = pathway) %>%
+  as_tibble() %>%
+  arrange(padj)  # Sort by adjusted p-value
+
+# Tidy up C6 Oncogenic GSEA results
+fgseaResTidy_oncogenic <- fgseaRes_oncogenic %>%
+  mutate(abbrev_pathway = abbreviate(pathway)) %>%
+  relocate(abbrev_pathway, .after = pathway) %>%
+  as_tibble() %>%
+  arrange(padj)  # Sort by adjusted p-value
+
+# View top 10 enriched Hallmark pathways
+fgseaResTidy_hallmark %>% head(10)
+
+# View top 10 enriched Oncogenic pathways
+fgseaResTidy_oncogenic %>% head(10)
+
+```
+```{r}
+library(ggplot2)
+
+fgseaResTidy_hallmark %>%
+  mutate(NES2 = ifelse(NES > 0, "Positive", "Negative")) %>%
+  arrange(padj) %>%
+  head(20) %>%
+  ggplot(aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill = NES2)) +
+  scale_fill_manual(breaks = c("Positive", "Negative"), values = c("#61BB6F", "#EC7012")) +
+  theme(axis.text.y = element_text(size = 6)) +
+  coord_flip() +
+  labs(x = "Pathway", y = "Normalized Enrichment Score",
+       title = "Top 20 Hallmark Pathways (High Z-Score St Jude's Bulk-RNAseq Genes)")
+
+```
+
+
+
+# Task 5 Overlapping, LH only, NH only
+
+## Filtering
+
+```{r}
+selected_genes <- readxl::read_excel("St Jude Overlap_LH_NH_110824.xlsx")
+```
+
+```{r}
+# Step 1: Extract unique gene sets from the provided table `selected_genes`
+nh_only_genes <- unique(selected_genes$`NH only (178)`) %>% na.omit()
+lh_only_genes <- unique(selected_genes$`LH (88)`) %>% na.omit()
+overlap_genes <- unique(selected_genes$`Overlap (52)`) %>% na.omit()
+
+# Step 2: Combine genes in the specified order for the heatmap
+# NH-only genes at the top, followed by overlap genes, and then LH-only genes
+ordered_genes <- c(nh_only_genes, overlap_genes, lh_only_genes)
+
+# Step 3: Filter `ordered_genes` to only include genes that are present in `zscore_matrix`
+# This ensures we're only using genes that actually have data in the matrix
+valid_genes <- ordered_genes[ordered_genes %in% rownames(zscore_matrix)]
+
+# Step 4: Subset `zscore_matrix` to include only `valid_genes` and in the specified order
+# `drop = FALSE` keeps it as a matrix if there's only one gene
+filtered_zscore_matrix <- zscore_matrix[valid_genes, , drop = FALSE]  
+# Create an annotation data frame to label each gene
+gene_group <- rep(NA, length(valid_genes))
+gene_group[valid_genes %in% nh_only_genes] <- "NH only"
+gene_group[valid_genes %in% overlap_genes] <- "Overlap"
+gene_group[valid_genes %in% lh_only_genes] <- "LH only"
+
+annotation <- data.frame(Group = gene_group)
+rownames(annotation) <- valid_genes
+
+# Plot the heatmap with the annotation
+pheatmap(
+  filtered_zscore_matrix,
+  annotation_row = annotation,        # Add row annotation for gene groups
+  cluster_rows = F,               # Keep the gene order as specified
+  cluster_cols = F,               # No clustering for subtypes
+  main = "Z-Score Heatmap with NH, Overlap, and LH Groups",
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  color = colorRampPalette(c("blue", "white", "red"))(50),
+  fontsize_col = 8,
+  fontsize_row = 6
+)
+
+```
+
+## Anotteing 3
+
+```{r}
+# Separate genes by groups
+nh_only_genes <- unique(selected_genes$`NH only (178)`) %>% na.omit()
+overlap_genes <- unique(selected_genes$`Overlap (52)`) %>% na.omit()
+lh_only_genes <- unique(selected_genes$`LH (88)`) %>% na.omit()
+
+# Filter z-score matrix for each gene group
+filtered_zscore_matrix_nh_only <- filtered_zscore_matrix[rownames(filtered_zscore_matrix) %in% nh_only_genes, ]
+filtered_zscore_matrix_overlap <- filtered_zscore_matrix[rownames(filtered_zscore_matrix) %in% overlap_genes, ]
+filtered_zscore_matrix_lh_only <- filtered_zscore_matrix[rownames(filtered_zscore_matrix) %in% lh_only_genes, ]
+
+
+filtered_zscore_matrix_nh_only <- as.data.frame(filtered_zscore_matrix_nh_only) %>%
+  arrange(desc(`Near haploid_avg`)) %>% 
+  as.matrix()
+
+
+filtered_zscore_matrix_lh_only <- as.data.frame(filtered_zscore_matrix_lh_only) %>%
+  arrange(desc(`Low hyperdiploid_avg`)) %>% 
+  as.matrix()
+
+
+
+# Plot heatmap for NH only genes
+pheatmap(
+  filtered_zscore_matrix_nh_only,
+  cluster_rows = F,               # Cluster genes within the NH only group
+  cluster_cols = FALSE,               # No clustering for subtypes
+  main = "Z-Score Heatmap for NH Only Genes",
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  color = colorRampPalette(c("blue", "white", "red"))(50),
+  fontsize_col = 8,
+  fontsize_row = 6
+)
+
+# Plot heatmap for Overlap genes
+pheatmap(
+  filtered_zscore_matrix_overlap,
+  cluster_rows = TRUE,               # Cluster genes within the Overlap group
+  cluster_cols = FALSE,               # No clustering for subtypes
+  main = "Z-Score Heatmap for Overlap Genes",
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  color = colorRampPalette(c("blue", "white", "red"))(50),
+  fontsize_col = 8,
+  fontsize_row = 6
+)
+
+# Plot heatmap for LH only genes
+pheatmap(
+  filtered_zscore_matrix_lh_only,
+  cluster_rows = F,               # Cluster genes within the LH only group
+  cluster_cols = FALSE,               # No clustering for subtypes
+  main = "Z-Score Heatmap for LH Only Genes",
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  color = colorRampPalette(c("blue", "white", "red"))(50),
+  fontsize_col = 8,
+  fontsize_row = 6
+)
+
+```
+
+# Task 6  Pharmacotypes (Quartile plots of LC50)
+
+```{r}
+ic50_drugs_gene <- read.csv("imputed_lc50_data.csv") %>% 
+  dplyr::select(-c(".id", ".imp"))
+rnaseq_drugs_list <- read.csv("pharmacotyping_ped_rnaseq_fpkm_ALLids_0823.csv")
+```
+
+### Colapsing the imputations
+
+```{r}
+# Collapse imputations into one average row per patient
+# Collapse imputations and overwrite the original data
+ic50_drugs_gene_list <- ic50_drugs_gene %>%
+    group_by(subject_id) %>%
+    summarise(across(starts_with("CHZ"):Vorinostat, mean, na.rm = TRUE)) %>%
+    ungroup()
+
+######
+# Here remember that I put 'ic50_drugs_gene' for using all 10 imputations and 'ic50_drugs_gene_list' for using their avg
+#####
+
+# Inspect the resulting dataframe
+print(head(ic50_drugs_gene_list))
+```
+
+
+## Task 6.1: Rank Patient Samples Based on Expression of Each Gene
+
+
+```{r}
+# Define the list of target genes
+target_genes <- c("GEM", "INHBE", "RASL11A", "CYP7B1", "NFKBIE", 
+                  "ZBTB10", "CTSB", "OLAH", "FAM76B")
+
+
+# Extract and process GEM expression data
+if ("GEM" %in% rnaseq_drugs_list$GeneName) {
+    gene_expression <- rnaseq_drugs_list[rnaseq_drugs_list$GeneName == "GEM", ]
+    expression_values <- gene_expression[, !(names(gene_expression) %in% c("GeneID", "GeneName")), drop = FALSE]
+    expression_df <- as.data.frame(t(expression_values))
+    colnames(expression_df) <- "Expression"
+    expression_df$Patient <- rownames(expression_df)
+} else {
+    stop("Gene GEM not found in the dataset.")
+}
+```
+
+
+```{r}
+# Define quartiles for GEM expression
+expression_df$Quartile <- cut(
+    expression_df$Expression,
+    breaks = quantile(expression_df$Expression, probs = seq(0, 1, 0.25), na.rm = TRUE),
+    labels = c("Q1", "Q2", "Q3", "Q4"),
+    include.lowest = TRUE
+)
+```
+
+
+
+```{r}
+# Merge expression data with IC50 data
+merged_df <- merge(expression_df, ic50_drugs_gene, by.x = "Patient", by.y = "subject_id")
+```
+
+
+```{r}
+# Step 4: Perform Kruskal-Wallis and Pairwise Wilcoxon Tests for Each Drug
+
+# Prepare an empty data frame to store pairwise test results
+pairwise_results <- data.frame()
+
+# Pivot to long format for easier manipulation
+drug_data_long <- merged_df %>%
+    pivot_longer(cols = starts_with("CHZ"):Vorinostat, names_to = "Drug", values_to = "LC50")
+
+# Loop over each drug to perform Kruskal-Wallis and pairwise Wilcoxon tests
+for (drug in unique(drug_data_long$Drug)) {
+    # Filter data for the specific drug
+    drug_data <- drug_data_long %>% filter(Drug == drug)
+    
+    # Perform Kruskal-Wallis test
+    kw_test <- kruskal_test(data = drug_data, LC50 ~ Quartile)
+    
+    # If the Kruskal-Wallis test is significant, proceed with pairwise Wilcoxon tests
+    if (kw_test$p < 0.05) {
+        # Conduct pairwise Wilcoxon test and adjust for multiple testing
+        pw_test <- drug_data %>%
+            pairwise_wilcox_test(LC50 ~ Quartile, p.adjust.method = "fdr") %>%
+            mutate(Drug = drug)  # Add the drug name to the results
+        
+        # Append results to the pairwise_results data frame
+        pairwise_results <- bind_rows(pairwise_results, pw_test)
+    }
+}
+
+# Step 5: Finalize and Display Results
+# Clean up the results, focusing on relevant columns
+pairwise_results <- pairwise_results %>%
+    dplyr::select(Drug, group1, group2, p, p.adj, p.adj.signif) %>%
+    arrange(Drug, p.adj)
+
+# Display the pairwise results for interpretation
+print(pairwise_results)
+```
+
+## All genes across all drugs AVERAGE
+
+```{r}
+# Define the list of target genes
+target_genes <- c("GEM", "INHBE", "RASL11A", "CYP7B1", "NFKBIE", 
+                  "ZBTB10", "CTSB", "OLAH", "FAM76B")
+
+# Initialize a list to store pairwise results for each gene
+all_pairwise_results <- list()
+
+# Loop through each gene to perform statistical tests
+for (gene in target_genes) {
+  # Extract and process expression data for the current gene
+  if (gene %in% rnaseq_drugs_list$GeneName) {
+    gene_expression <- rnaseq_drugs_list[rnaseq_drugs_list$GeneName == gene, ]
+    expression_values <- gene_expression[, !(names(gene_expression) %in% c("GeneID", "GeneName")), drop = FALSE]
+    expression_df <- as.data.frame(t(expression_values))
+    colnames(expression_df) <- "Expression"
+    expression_df$Patient <- rownames(expression_df)
+  } else {
+    stop(paste("Gene", gene, "not found in the dataset."))
+  }
+
+  # Define quartiles for the current gene expression
+  quantiles <- quantile(expression_df$Expression, probs = seq(0, 1, 0.25), na.rm = TRUE)
+  if (length(unique(quantiles)) < 5) {
+    message(paste("Quantiles are not unique for gene", gene, "- skipping."))
+    next
+  }
+  
+  expression_df$Quartile <- cut(
+    expression_df$Expression,
+    breaks = quantiles,
+    labels = c("Q1", "Q2", "Q3", "Q4"),
+    include.lowest = TRUE
+  )
+
+  # Merge expression data with IC50 data (averaged)
+  merged_df <- merge(expression_df, ic50_drugs_gene_list, by.x = "Patient", by.y = "subject_id")
+
+  # Perform Kruskal-Wallis and Pairwise Wilcoxon Tests for Each Drug
+  pairwise_results <- data.frame()
+
+  # Pivot to long format for easier manipulation
+  drug_data_long <- merged_df %>%
+    pivot_longer(cols = starts_with("CHZ"):Vorinostat, names_to = "Drug", values_to = "LC50")
+
+  # Loop over each drug to perform Kruskal-Wallis and pairwise Wilcoxon tests
+  for (drug in unique(drug_data_long$Drug)) {
+    drug_data <- drug_data_long %>% filter(Drug == drug)
+    kw_test <- kruskal_test(data = drug_data, LC50 ~ Quartile)
+    
+    if (kw_test$p < 0.05) {
+      pw_test <- drug_data %>%
+        pairwise_wilcox_test(LC50 ~ Quartile, p.adjust.method = "fdr") %>%
+        mutate(Drug = drug)
+      pairwise_results <- bind_rows(pairwise_results, pw_test)
+    }
+  }
+
+  # Store the results for the current gene
+  all_pairwise_results[[gene]] <- pairwise_results
+
+  # Check if pairwise_results is populated correctly
+  if (nrow(pairwise_results) == 0) {
+    message(paste("No significant pairwise comparisons for gene", gene))
+  }
+}
+
+# Now proceed to plotting for genes with significant pairwise comparisons
+for (gene in target_genes) {
+  pairwise_results <- all_pairwise_results[[gene]]
+  
+  # Check if there are significant results to plot
+  if (is.null(pairwise_results) || nrow(pairwise_results) == 0) {
+    next
+  }
+  
+  pairwise_results <- pairwise_results %>%
+    dplyr::select(Drug, group1, group2, p, p.adj, p.adj.signif) %>%
+    arrange(Drug, p.adj)
+  
+  # Extract unique drugs with significant pairwise comparisons
+  significant_drugs <- unique(pairwise_results$Drug[pairwise_results$p.adj.signif != "ns"])
+  
+  # Define the base directory
+  base_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Integrated_D_R_curtis/tasks_results/task6_stjudes_pharmacotypes/avarage_imputs_all_quartiles"
+
+  # Create a directory for the gene within the base directory
+  dir.create(file.path(base_dir, gene), showWarnings = FALSE)
+  
+  # Loop over each significant drug to create and display plots
+  for (drug in significant_drugs) {
+    drug_data <- merged_df %>%
+      dplyr::select(Patient, Quartile, !!sym(drug)) %>%
+      rename(LC50 = !!sym(drug))
+    
+    n_data <- drug_data %>%
+      group_by(Quartile) %>%
+      summarise(n = n())
+    
+    comparison_data <- pairwise_results %>%
+      filter(Drug == drug) %>%
+      mutate(p.adj.signif = ifelse(p.adj.signif == "NS", "ns", p.adj.signif),  # Ensure lowercase "ns"
+             y.position = max(drug_data$LC50, na.rm = TRUE) * 1.1)
+    
+    comparisons <- comparison_data %>%
+      dplyr::select(group1, group2) %>%
+      split(seq(nrow(comparison_data))) %>%
+      lapply(unlist)
+    
+    plot <- ggplot(drug_data, aes(x = Quartile, y = LC50, fill = Quartile)) +
+      geom_boxplot(outlier.shape = NA) +
+      viridis::scale_fill_viridis(discrete = TRUE, option = "D") +
+      labs(
+        title = paste("LC50 Distribution for", drug, "Across Quartiles of", gene, "expression (Averaged)"),
+        x = "Quartile",
+        y = "LC50"
+      ) +
+      theme_minimal() +
+      theme(
+        plot.title = element_text(hjust = 0.5, size = 14),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 13)
+      ) +
+      geom_text(
+        data = n_data,
+        aes(x = Quartile, y = min(drug_data$LC50, na.rm = TRUE) * 0.95, label = paste0("n = ", n)),
+        color = "black",
+        size = 4
+      ) +
+      geom_signif(
+        comparisons = comparisons,
+        annotations = comparison_data$p.adj.signif,  # Explicitly use the modified lowercase "ns" column
+        y_position = seq(
+          from = max(drug_data$LC50, na.rm = TRUE) * 1.05, 
+          by = 0.08, 
+          length.out = nrow(comparison_data)
+        ),  # Space out annotations
+        map_signif_level = TRUE,
+        tip_length = 0.005,
+        textsize = 5
+      )
+    
+    print(plot)
+    
+    # Save the plot to a file in the respective gene directory
+    ggsave(
+  filename = file.path(base_dir, gene, paste0("LC50_Distribution_", drug, "_", gene, "_Averaged.pdf")), 
+  plot = plot, 
+  width = 8,  # Adjust the width as needed
+  height = 5, # Adjust the height as needed
+  units = "in" # Use inches for measurement
+)
+  }
+}
+
+```
+## All genes across all drugs NON-AVERAGE
+
+```{r}
+# Define the list of target genes
+target_genes <- c("GEM", "INHBE", "RASL11A", "CYP7B1", "NFKBIE", 
+                  "ZBTB10", "CTSB", "OLAH", "FAM76B")
+
+# Initialize a list to store pairwise results for each gene
+all_pairwise_results <- list()
+
+# Loop through each gene to perform statistical tests
+for (gene in target_genes) {
+  # Extract and process expression data for the current gene
+  if (gene %in% rnaseq_drugs_list$GeneName) {
+    gene_expression <- rnaseq_drugs_list[rnaseq_drugs_list$GeneName == gene, ]
+    expression_values <- gene_expression[, !(names(gene_expression) %in% c("GeneID", "GeneName")), drop = FALSE]
+    expression_df <- as.data.frame(t(expression_values))
+    colnames(expression_df) <- "Expression"
+    expression_df$Patient <- rownames(expression_df)
+  } else {
+    stop(paste("Gene", gene, "not found in the dataset."))
+  }
+
+  # Define quartiles for the current gene expression
+  quantiles <- quantile(expression_df$Expression, probs = seq(0, 1, 0.25), na.rm = TRUE)
+  if (length(unique(quantiles)) < 5) {
+    message(paste("Quantiles are not unique for gene", gene, "- skipping."))
+    next
+  }
+  
+  expression_df$Quartile <- cut(
+    expression_df$Expression,
+    breaks = quantiles,
+    labels = c("Q1", "Q2", "Q3", "Q4"),
+    include.lowest = TRUE
+  )
+
+  # Merge expression data with IC50 data
+  merged_df <- merge(expression_df, ic50_drugs_gene, by.x = "Patient", by.y = "subject_id")
+
+  # Perform Kruskal-Wallis and Pairwise Wilcoxon Tests for Each Drug
+  pairwise_results <- data.frame()
+
+  # Pivot to long format for easier manipulation
+  drug_data_long <- merged_df %>%
+    pivot_longer(cols = starts_with("CHZ"):Vorinostat, names_to = "Drug", values_to = "LC50")
+
+  # Loop over each drug to perform Kruskal-Wallis and pairwise Wilcoxon tests
+  for (drug in unique(drug_data_long$Drug)) {
+    drug_data <- drug_data_long %>% filter(Drug == drug)
+    kw_test <- kruskal_test(data = drug_data, LC50 ~ Quartile)
+    
+    if (kw_test$p < 0.05) {
+      pw_test <- drug_data %>%
+        pairwise_wilcox_test(LC50 ~ Quartile, p.adjust.method = "fdr") %>%
+        mutate(Drug = drug)
+      pairwise_results <- bind_rows(pairwise_results, pw_test)
+    }
+  }
+
+  # Store the results for the current gene
+  all_pairwise_results[[gene]] <- pairwise_results
+
+  # Check if pairwise_results is populated correctly
+  if (nrow(pairwise_results) == 0) {
+    message(paste("No significant pairwise comparisons for gene", gene))
+  }
+}
+
+# Now proceed to plotting for genes with significant pairwise comparisons
+for (gene in target_genes) {
+  pairwise_results <- all_pairwise_results[[gene]]
+  
+  # Check if there are significant results to plot
+  if (is.null(pairwise_results) || nrow(pairwise_results) == 0) {
+    next
+  }
+  
+  pairwise_results <- pairwise_results %>%
+    dplyr::select(Drug, group1, group2, p, p.adj, p.adj.signif) %>%
+    arrange(Drug, p.adj)
+  
+  # Extract unique drugs with significant pairwise comparisons
+  significant_drugs <- unique(pairwise_results$Drug[pairwise_results$p.adj.signif != "ns"])
+  
+  # Define the base directory
+  base_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Integrated_D_R_curtis/tasks_results/task6_stjudes_pharmacotypes/noavarage_imputs_all_quartiles"
+
+  # Create a directory for the gene within the base directory
+  dir.create(file.path(base_dir, gene), showWarnings = FALSE)
+  
+  # Loop over each significant drug to create and display plots
+  for (drug in significant_drugs) {
+    drug_data <- merged_df %>%
+      dplyr::select(Patient, Quartile, !!sym(drug)) %>%
+      rename(LC50 = !!sym(drug))
+    
+    n_data <- drug_data %>%
+      group_by(Quartile) %>%
+      summarise(n = n())
+    
+    comparison_data <- pairwise_results %>%
+      filter(Drug == drug) %>%
+      mutate(p.adj.signif = ifelse(p.adj.signif == "NS", "ns", p.adj.signif),  # Ensure lowercase "ns"
+             y.position = max(drug_data$LC50, na.rm = TRUE) * 1.1)
+    
+    comparisons <- comparison_data %>%
+      dplyr::select(group1, group2) %>%
+      split(seq(nrow(comparison_data))) %>%
+      lapply(unlist)
+    
+    plot <- ggplot(drug_data, aes(x = Quartile, y = LC50, fill = Quartile)) +
+      geom_boxplot(outlier.shape = NA) +
+      viridis::scale_fill_viridis(discrete = TRUE, option = "D") +
+      labs(
+        title = paste("LC50 Distribution for", drug, "Across Quartiles of", gene, "expression (Non-Averaged)"),
+        x = "Quartile",
+        y = "LC50"
+      ) +
+      theme_minimal() +
+      theme(
+        plot.title = element_text(hjust = 0.5, size = 14),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 13)
+      ) +
+      geom_text(
+        data = n_data,
+        aes(x = Quartile, y = min(drug_data$LC50, na.rm = TRUE) * 0.95, label = paste0("n = ", n)),
+        color = "black",
+        size = 4
+      ) +
+      geom_signif(
+        comparisons = comparisons,
+        annotations = comparison_data$p.adj.signif,  # Explicitly use the modified lowercase "ns" column
+        y_position = seq(
+          from = max(drug_data$LC50, na.rm = TRUE) * 1.05, 
+          by = 0.08, 
+          length.out = nrow(comparison_data)
+        ),  # Space out annotations
+        map_signif_level = TRUE,
+        tip_length = 0.005,
+        textsize = 5
+      )
+    
+    print(plot)
+    
+    # Save the plot to a file in the respective gene directory
+    ggsave(
+      filename = file.path(base_dir, gene, paste0("LC50_Distribution_", drug, "_", gene, "_NonAveraged.pdf")), 
+      plot = plot, 
+      width = 8,  # Adjust the width as needed
+      height = 5, # Adjust the height as needed
+      units = "in" # Use inches for measurement
+    )
+  }
+}
+```
+
+
+## AVg and non Avg-all of the genes for Q1 and Q4
+
+```{r}
+# Define the list of target genes
+target_genes <- c("GEM", "INHBE", "RASL11A", "CYP7B1", "NFKBIE", 
+                  "ZBTB10", "CTSB", "OLAH", "FAM76B")
+
+# Define the base directory for saving plots
+base_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Integrated_D_R_curtis/tasks_results/task6_stjudes_pharmacotypes"
+
+# Function to generate and save plots
+generate_plots <- function(data, pairwise_results, base_dir, sub_dir, data_type) {
+  # Check if `pairwise_results` is empty
+  if (nrow(pairwise_results) == 0) {
+    stop("The `pairwise_results` dataframe is empty. Ensure statistical analysis is complete before running this script.")
+  }
+  
+  # Loop through each gene in target_genes
+  for (target_gene in target_genes) {
+    
+    # Check if the target gene exists in the data
+    if (target_gene %in% data$GeneName) {
+      # Extract expression data for the target gene
+      gene_expression <- data[data$GeneName == target_gene, ]
+      expression_values <- gene_expression[, !(names(gene_expression) %in% c("GeneID", "GeneName")), drop = FALSE]
+      expression_df <- as.data.frame(t(expression_values))
+      colnames(expression_df) <- "Expression"
+      expression_df$Patient <- rownames(expression_df)
+      
+      # Define quartiles for the current gene expression
+      quantiles <- quantile(expression_df$Expression, probs = seq(0, 1, 0.25), na.rm = TRUE)
+      if (length(unique(quantiles)) < 5) {
+        message(paste("Quantiles are not unique for gene", target_gene, "- skipping."))
+        next
+      }
+      
+      expression_df$Quartile <- cut(
+        expression_df$Expression,
+        breaks = quantiles,
+        labels = c("Q1", "Q2", "Q3", "Q4"),
+        include.lowest = TRUE
+      )
+      
+      # Filter to only Q1 and Q4
+      expression_df <- expression_df %>% filter(Quartile %in% c("Q1", "Q4"))
+      
+      # Merge with LC50 data
+      merged_df <- merge(expression_df, ic50_drugs_gene, by.x = "Patient", by.y = "subject_id")
+      
+      # Filter `pairwise_results` for drugs with significant Q1 vs Q4 comparisons
+      significant_drugs <- pairwise_results %>%
+        filter(group1 == "Q1", group2 == "Q4") %>%
+        dplyr::select(Drug, p.adj.signif) %>%
+        distinct()
+  
+      # Check if there are significant drugs
+      if (nrow(significant_drugs) == 0) {
+        message(paste("No significant Q1 vs Q4 comparisons found for gene", target_gene))
+        next
+      }
+  
+      # Create a subdirectory for the target gene in the base directory
+      gene_dir <- file.path(base_dir, sub_dir, target_gene)
+      dir.create(gene_dir, showWarnings = FALSE, recursive = TRUE)
+      
+      # Loop through each drug with a significant Q1 vs Q4 comparison
+      for (drug_info in unique(significant_drugs$Drug)) {
+        drug <- drug_info  # Extract drug name
+  
+        # Extract relevant columns and calculate sample size
+        drug_data <- merged_df %>%
+         dplyr::select(Patient, Quartile, !!sym(drug)) %>%
+          rename(LC50 = !!sym(drug))
+        
+        # Ensure there is data for both Q1 and Q4
+        if (nrow(drug_data) < 2) {
+          message(paste("Insufficient data for Q1 and Q4 for drug", drug, "- skipping."))
+          next
+        }
+  
+        n_data <- drug_data %>%
+          group_by(Quartile) %>%
+          summarise(n = n())
+        
+        # Fetch the Q1 vs Q4 comparison for this drug
+        comparison_data <- significant_drugs %>%
+          filter(Drug == drug) %>%
+          mutate(y.position = max(drug_data$LC50, na.rm = TRUE) * 1.1)
+        
+        # Define the comparison for geom_signif
+        comparisons <- list(c("Q1", "Q4"))
+  
+        # Generate and display the plot
+        plot <- ggplot(drug_data, aes(x = Quartile, y = LC50, fill = Quartile)) +
+          geom_boxplot(outlier.shape = NA) +
+          viridis::scale_fill_viridis(discrete = TRUE, option = "D") +
+          labs(
+            title = paste("LC50 Distribution for", drug, "Between Q1 and Q4 of", target_gene, "expression (", data_type, ")"),
+            x = "Quartile",
+            y = "LC50"
+          ) +
+          theme_minimal() +
+          theme(
+            plot.title = element_text(hjust = 0.5, size = 14),
+            axis.text = element_text(size = 12),
+            axis.title = element_text(size = 13)
+          ) +
+          geom_text(
+            data = n_data,
+            aes(x = Quartile, y = min(drug_data$LC50, na.rm = TRUE) * 0.95, label = paste0("n = ", n)),
+            color = "black",
+            size = 4
+          ) +
+          geom_signif(
+            comparisons = comparisons,
+            annotations = comparison_data$p.adj.signif,
+            y_position = comparison_data$y.position,
+            map_signif_level = TRUE,
+            tip_length = 0.005,
+            textsize = 5
+          )
+        
+        # Display the plot
+        print(plot)
+        
+        # Save the plot to a file in the respective gene directory
+        plot_filename <- file.path(gene_dir, paste0("LC50_Distribution_", drug, "_", target_gene, "_", data_type, ".pdf"))
+        ggsave(
+          filename = plot_filename, 
+          plot = plot, 
+          width = 8,  # Adjust the width as needed
+          height = 5, # Adjust the height as needed
+          units = "in" # Use inches for measurement
+        )
+      }
+    } else {
+      message(paste("Gene", target_gene, "not found in the dataset."))
+    }
+  }
+}
+
+# Generate plots for averaged data
+generate_plots(rnaseq_drugs_list, pairwise_results, base_dir, "avarage_imputs_q1_q4", "averaged")
+
+# Generate plots for non-averaged data
+generate_plots(rnaseq_drugs_list, pairwise_results, base_dir, "noavarage_imputs_q1_q4", "non-averaged")
+
+```
+
+
+
+
+# Task 7. November 18
+
+## Task 7.1 "Using the low hypodiploid samples from St Jude FKPM data, can you split that group into GEM expression quartiles. Can you then run Hallmarks pathway analysis on each quartile."
+
+```{r}
+# Loading the huge dataframe again
+stjudes_df
+```
+
+```{r}
+# Keeping only LH samples
+
+# Filter columns that contain "Low hyperdiploid"
+LH_only_sjudes_df <- stjudes_df %>%
+ dplyr::select(Gene, contains("Low hyperdiploid"))
+```
+
+
+```{r}
+
+# Step 1: Extract the GEM row from the Low hyperdiploid dataframe
+gem_row <- LH_only_sjudes_df %>%
+  filter(Gene == "GEM")
+
+# Step 2: Transpose the GEM expression values to a vector for quartile calculation
+gem_values <- as.numeric(unlist(gem_row %>%dplyr::select(-Gene)))
+
+# Step 3: Calculate quartiles and assign each value to its quartile group
+gem_quartiles <- cut(gem_values, 
+                     breaks = quantile(gem_values, probs = seq(0, 1, 0.25), na.rm = TRUE), 
+                     include.lowest = TRUE, 
+                     labels = c("Q1", "Q2", "Q3", "Q4"))
+
+# Step 4: Combine GEM values with quartile assignments
+gem_quartile_df <- data.frame(
+  Sample = names(gem_row)[-1],  # Column names as sample IDs
+  Expression = gem_values,
+  Quartile = gem_quartiles
+)
+
+# Display the quartile assignments
+print(gem_quartile_df)
+
+```
+
+```{r}
+# plotting that
+ggplot(gem_quartile_df, aes(x = Quartile, y = Expression)) +
+  geom_boxplot() +
+  labs(title = "GEM Expression by Quartile in LH samples",
+       x = "Quartile",
+       y = "Expression")
+```
+
+```{r}
+gene_quartile_summary <- LH_only_sjudes_df %>%
+  pivot_longer(cols = -Gene, names_to = "Sample", values_to = "Expression") %>%
+  left_join(gem_quartile_df, by = "Sample") %>%
+  group_by(Gene, Quartile) %>%
+  summarize(Average_Expression = mean(Expression.x, na.rm = TRUE), .groups = 'drop')
+
+```
+
+## Testing for Q1 first:
+
+```{r, fig.width=8}
+q1_specific_genes <- gene_quartile_summary %>%
+  filter(Quartile == "Q1") %>%
+  arrange(desc(Average_Expression))
+
+
+# Step 1: Prepare Ranked Gene List
+# Filter and rank genes for Q1
+q1_genes <- q1_specific_genes %>%
+ dplyr::select(Gene, Average_Expression) %>%
+  arrange(desc(Average_Expression))
+
+# Create a named vector of ranked genes
+gene_ranks <- q1_genes %>%
+  deframe()
+
+# Break ties in ranked genes by adding small random noise
+set.seed(123)  # For reproducibility
+gene_ranks <- gene_ranks + rnorm(length(gene_ranks), mean = 0, sd = 1e-5)
+
+# Step 2: Retrieve Hallmark Pathways
+# Retrieve Hallmark gene sets for Homo sapiens
+hallmark_pathways <- msigdbr(species = "Homo sapiens", category = "H")
+
+# Format pathways for fgsea
+hallmark_pathway_list <- hallmark_pathways %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+# Step 3: Perform GSEA
+# Run fgseaMultilevel for better precision
+fgsea_results <- fgsea(
+  pathways = hallmark_pathway_list,
+  stats = gene_ranks,
+  minSize = 15,
+  maxSize = 500,
+  eps = 0  # Increases precision for very small p-values
+)
+
+# Step 4: Process Results
+# Convert results to a tidy tibble and filter significant pathways
+fgsea_tidy <- fgsea_results %>%
+  as_tibble() %>%
+  arrange(padj)
+
+# Filter significant pathways (padj < 0.05)
+significant_pathways <- fgsea_tidy %>%
+  filter(padj < 0.05)
+
+# Step 5: Visualize Top Enriched Pathways
+# Bar plot of top 20 significant pathways by NES
+fgsea_tidy %>%
+  filter(padj < 0.05) %>%          # Filter significant pathways
+  slice_min(padj, n = 20) %>%     # Select top 20 pathways by adjusted p-value
+  ggplot(aes(x = reorder(pathway, NES), y = NES, fill = NES > 0)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Top Enriched Hallmark Pathways of Q1 GEM expression",
+    x = "Pathway",
+    y = "Normalized Enrichment Score (NES)"
+  ) +
+  scale_fill_manual(values = c("TRUE" = "#61BB6F", "FALSE" = "#EC7012")) +
+  theme_minimal()
+
+```
+
+
+## Trying a loop for all quartiles
+```{r}
+# Retrieve Hallmark gene sets for Homo sapiens
+hallmark_sets <- msigdbr(species = "Homo sapiens", category = "H")
+
+# Format the gene sets for fgsea
+fgsea_hallmark_sets <- hallmark_sets %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+# Function to perform GSEA for a given quartile
+perform_gsea <- function(quartile) {
+  # Filter and rank genes for the given quartile
+  quartile_genes <- gene_quartile_summary %>%
+    filter(Quartile == quartile) %>%
+    dplyr::select(Gene, Average_Expression) %>%
+    arrange(desc(Average_Expression))
+  
+  # Create a named vector of ranked genes
+  gene_ranks <- quartile_genes %>%
+    deframe()
+  
+  # Break ties in ranked genes by adding small random noise
+  set.seed(123)  # For reproducibility
+  gene_ranks <- gene_ranks + runif(length(gene_ranks), min = -1e-6, max = 1e-6)
+  
+  # Perform GSEA with eps set to zero
+  fgsea_results <- fgsea(pathways = fgsea_hallmark_sets, stats = gene_ranks, eps = 0)
+  
+# Tidy the results
+fgsea_results_tidy <- fgsea_results %>%
+  as_tibble() %>%
+  arrange(padj)
+
+# Extract leading edge genes and include their expression for the specific quartile
+leading_edge_genes <- fgsea_results %>%
+  filter(padj < 0.05) %>%
+  dplyr::select(pathway, leadingEdge) %>%
+  unnest(cols = c(leadingEdge)) %>%
+  distinct() %>%
+  left_join(gene_quartile_summary %>% filter(Quartile == quartile) %>% distinct(Gene, .keep_all = TRUE), by = c("leadingEdge" = "Gene"))
+  
+  # Save the plot
+  output_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Integrated_D_R_curtis/tasks_results/task7/task7.1"
+  # Save leading edge genes to CSV
+  write_csv(leading_edge_genes, paste0(output_dir, "/Leading_Edge_Genes_", quartile, ".csv"))
+  
+  # Plot the top 20 pathways
+  plot <- fgsea_results_tidy %>%
+    filter(pval < 0.05) %>%
+    arrange(padj) %>%
+    head(n = 20) %>%
+    ggplot(aes(reorder(pathway, NES), NES)) +
+    geom_col(aes(fill = NES > 0)) +
+    scale_fill_manual(values = c("TRUE" = "#61BB6F", "FALSE" = "#EC7012")) +
+    coord_flip() +
+    labs(x = "Pathway", y = "Normalized Enrichment Score", title = paste("Top 20 Hallmark Pathways of", quartile, "GEM expression with padj<0.05")) +
+    theme_minimal()
+  
+  
+  ggsave(filename = paste0(output_dir, "/Top_20_Hallmark_Pathways_", quartile, ".pdf"), plot = plot, width = 16, height = 9)
+}
+
+# Perform GSEA for each quartile
+quartiles <- c("Q1", "Q2", "Q3", "Q4")
+lapply(quartiles, perform_gsea)
+```
+### Task 7.1.1 perform DE analysis of Q1 versus Q4 of Task 7.1
+```{r}
+# Create metadata for Q1 and Q4 samples
+meta_data_q1_q4 <- gem_quartile_df %>%
+  filter(Quartile %in% c("Q1", "Q4")) %>%
+  mutate(condition = ifelse(Quartile == "Q1", "Q1", "Q4"))
+
+# Ensure the sample names match the count data
+meta_data_q1_q4 <- meta_data_q1_q4 %>%
+  rename(sample = Sample)
+
+# Filter the count data to include only Q1 and Q4 samples
+count_data_q1_q4 <- LH_only_sjudes_df %>%
+ dplyr::select(Gene, all_of(meta_data_q1_q4$sample))
+
+# Create a design matrix
+design <- model.matrix(~ 0 + meta_data_q1_q4$condition)
+colnames(design) <- c("Q1", "Q4")
+
+# Ensure the row names of meta_data_q1_q4 match the column names of count_data_q1_q4
+rownames(meta_data_q1_q4) <- meta_data_q1_q4$sample
+count_data_q1_q4 <- count_data_q1_q4 %>%
+  column_to_rownames(var = "Gene")
+```
+
+```{r}
+# Fit the linear model
+fit <- lmFit(count_data_q1_q4, design)
+
+# Create a contrast matrix
+contrast_matrix <- makeContrasts(Q4 - Q1, levels = design)
+
+# Fit the contrasts
+fit2 <- contrasts.fit(fit, contrast_matrix)
+fit2 <- eBayes(fit2)
+```
+
+```{r}
+results <- topTable(fit2, adjust = "fdr", number = Inf)
+summary(results)
+
+# Convert results to a data frame
+de_results_q1_vs_q4 <- as.data.frame(results)
+```
+### Volcano plot
+
+```{r, fig.width=18}
+# Define custom colors, sizes, and alphas for the plot
+cols <- c("up" = "#ffad73", "down" = "#26b3ff", "ns" = "grey")
+sizes <- c("up" = 2, "down" = 2, "ns" = 1)
+alphas <- c("up" = 1, "down" = 1, "ns" = 0.5)
+
+# Prepare the data for plotting
+volcano_data <- de_results_q1_vs_q4 %>%
+  rownames_to_column("GeneSymbol") %>%
+  dplyr::select(GeneSymbol, logFC, adj.P.Val) %>%
+  mutate(FoldChange = 2^logFC) %>%
+  mutate(GeneType = case_when(
+    logFC >= 1 & adj.P.Val <= 0.05 ~ "up",
+    logFC <= -1 & adj.P.Val <= 0.05 ~ "down",
+    TRUE ~ "ns"
+  ))
+
+# Create the volcano plot
+volcano_plot <- volcano_data %>%
+  ggplot(aes(x = logFC, y = -log10(adj.P.Val),
+             fill = GeneType, size = GeneType, alpha = GeneType)) +
+  geom_point(shape = 21, colour = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+  scale_fill_manual(values = cols) +
+  scale_size_manual(values = sizes) +
+  scale_alpha_manual(values = alphas) +
+  geom_text_repel(
+    data = filter(volcano_data, adj.P.Val < 0.05),
+    aes(x = logFC, y = -log10(adj.P.Val), label = GeneSymbol),
+    size = 5,
+    color = "darkblue",
+    max.overlaps = 10,
+    min.segment.length = Inf,
+    inherit.aes = FALSE
+  ) +
+  labs(title = "Volcano Plot of DE Genes: Q1 vs Q4 with adj.P.Val <= 0.05 and logFC > |1|",
+       x = "log2(Fold Change)",
+       y = "-log10(Adjusted P-value)") +
+  theme_minimal(base_family = "Arial") +
+  theme(
+    panel.background = element_rect(fill = "white", colour = NA),
+    plot.background = element_rect(fill = "white", colour = NA),
+    legend.position = "bottom",
+    plot.title = element_text(size = 20, face = "bold"),
+    axis.title.x = element_text(size = 18),
+    axis.title.y = element_text(size = 18),
+    axis.text = element_text(size = 14),
+    legend.text = element_text(size = 14),
+    legend.title = element_text(size = 16)
+  )
+
+# Display the plot
+print(volcano_plot)
+
+# Save the plot with high resolution and proper background settings
+ggsave("volcano_plot_q1_vs_q4.png", plot = volcano_plot, width = 16, height = 9, dpi = 300, bg = "white")
+```
+
+### Now hallmakrs on those DEGs
+
+```{r}
+# Retrieve Hallmark gene sets for Homo sapiens
+hallmark_pathways <- msigdbr(species = "Homo sapiens", category = "H")
+
+# Format pathways for fgsea
+hallmark_pathway_list <- hallmark_pathways %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+filtered_genes <- de_results_q1_vs_q4 %>%
+  filter(abs(logFC) > 1) %>%
+  rownames_to_column("GeneSymbol")
+```
+
+### Prepare gene ranks
+
+```{r}
+# Rank genes based on log2 fold change
+gene_ranks <- filtered_genes %>%
+  dplyr::select(GeneSymbol, logFC) %>%
+  arrange(desc(logFC)) %>%
+  deframe()
+
+# Ensure all values are finite
+gene_ranks <- gene_ranks[is.finite(gene_ranks)]
+
+# Add small random noise to break ties
+set.seed(123)
+gene_ranks <- gene_ranks + runif(length(gene_ranks), min = -1e-6, max = 1e-6)
+```
+
+```{r}
+# Perform GSEA with adjusted parameters
+fgsea_results <- fgsea(
+  pathways = hallmark_pathway_list,
+  stats = gene_ranks,
+  minSize = 10,  # Reduced minSize to include smaller pathways
+  maxSize = 1000,  # Increased maxSize to include larger pathways
+  eps = 0
+)
+
+# Tidy the results
+fgsea_tidy_7.1.1 <- fgsea_results %>%
+  as_tibble() %>%
+  arrange(padj)
+
+ 
+```
+
+
+```{r, fig.width=10}
+# Plot the top 20 pathways
+plot_7.1.1 <- fgsea_tidy_7.1.1 %>%
+  slice_min(padj, n = 20) %>%
+  ggplot(aes(x = reorder(pathway, NES), y = NES, fill = NES > 0)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Top Enriched Hallmark Pathways: Q1 vs Q4 (logFC > 1)",
+    x = "Pathway",
+    y = "Normalized Enrichment Score (NES)"
+  ) +
+  scale_fill_manual(values = c("TRUE" = "#61BB6F", "FALSE" = "#EC7012")) +
+  theme_minimal()
+
+# Display the plot
+print(plot_7.1.1)
+
+# Save the plot with high resolution and proper background settings
+#ggsave("hallmark_pathways_q1_vs_q4.png", plot = plot, width = 16, height = 9, dpi = 300, bg = "white")
+```
+
+
+## Task 7.2  Run Hallmarks pathway analysis on diagnosis versus relapse leukemia from the individual scRNA-seq LH samples (LH001, LH002, LH003).
+
+```{r}
+matts_df_LH_7.2 <- as.data.frame(filtered_bulk_matrix) %>% 
+ dplyr::select(starts_with("LH"))
+```
+
+### Subsetting Metadata
+```{r}
+# Create metadata (e.g., Diagnosis and Relapse labels for your columns)
+meta_data_7.2 <- data.frame(
+  sample = colnames(matts_df_LH_7.2)[-1],  # Exclude the Gene column
+  condition = ifelse(grepl("-D", colnames(matts_df_LH_7.2)[-1]), "Diagnosis", "Relapse"),
+  stringsAsFactors = FALSE
+)
+```
+### Running DESeq   
+```{r}
+# Create DESeq2 dataset
+dds_7.2 <- DESeqDataSetFromMatrix(countData = matts_df_LH_7.2[,-1], colData = meta_data_7.2, design = ~ condition)
+
+# Run DESeq2
+dds_7.2 <- DESeq(dds_7.2)
+
+# Get DE results
+res_7.2 <- results(dds_7.2)
+summary(res_7.2)
+
+de_results_all_D_vs_R_7.2 <- as.data.frame(res_7.2)
+```
+
+```{r, fig.width=10}
+# Retrieve Hallmark gene sets for Homo sapiens
+hallmark_pathways_7.2 <- msigdbr(species = "Homo sapiens", category = "H")
+
+# Format pathways for fgsea
+hallmark_pathway_list_7.2 <- hallmark_pathways_7.2 %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+# Rank genes based on log2 fold change
+gene_ranks_7.2 <- de_results_all_D_vs_R_7.2 %>%
+  rownames_to_column("GeneSymbol") %>%
+ dplyr::select(GeneSymbol, log2FoldChange) %>%
+  arrange(desc(log2FoldChange)) %>%
+  deframe()
+
+# Ensure all values are finite
+gene_ranks_7.2 <- gene_ranks_7.2[is.finite(gene_ranks_7.2)]
+
+# Add small random noise to break ties
+set.seed(123)
+gene_ranks_7.2 <- gene_ranks_7.2 + runif(length(gene_ranks_7.2), min = -1e-6, max = 1e-6)
+
+# Perform GSEA with adjusted parameters
+fgsea_results_7.2 <- fgsea(
+  pathways = hallmark_pathway_list_7.2,
+  stats = gene_ranks_7.2,
+  minSize = 10,  # Reduced minSize to include smaller pathways
+  maxSize = 1000,  # Increased maxSize to include larger pathways
+  eps = 0
+)
+# Tidy the results
+fgsea_tidy_7.2 <- fgsea_results_7.2 %>%
+  as_tibble() %>%
+  arrange(padj)
+
+# Filter significant pathways (padj < 0.05)
+significant_pathways_7.2 <- fgsea_tidy_7.2 %>%
+  filter(padj < 0.1)
+
+# Plot the top 20 pathways
+plot_7.2 <- fgsea_tidy_7.2 %>%
+  filter(padj < 0.1) %>%
+  slice_min(padj, n = 20) %>%
+  ggplot(aes(x = reorder(pathway, NES), y = NES, fill = NES > 0)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Top Enriched Hallmark Pathways: Diagnosis vs Relapse (padj < 0.1)",
+    x = "Pathway",
+    y = "Normalized Enrichment Score (NES)"
+  ) +
+  scale_fill_manual(values = c("TRUE" = "#61BB6F", "FALSE" = "#EC7012")) +
+  theme_minimal()
+
+plot_7.2
+
+# Save the plot
+#output_dir_7.2 <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Integrated_D_R_curtis/tasks_results/task7/task7.1"
+#ggsave(filename = paste0(output_dir_7.2, "/Top_20_Hallmark_Pathways_Diagnosis_vs_Relapse.pdf"), plot = plot_7.2)
+```
+
+### Task 7.2.1 Run each sample separately
+
+ 
+```{r}
+
+# Get list of pairs (Dx and Rx)
+pair_ids <- unique(gsub("-[DR]", "", colnames(matts_df_LH_7.2)))
+pairs <- lapply(pair_ids, function(id) {
+  list(
+    Dx = paste0(id, "-D"),
+    Rx = paste0(id, "-R")
+  )
+})
+```
+
+```{r}
+hallmark_pathways_7.2 <- msigdbr(species = "Homo sapiens", category = "H")
+
+# Format pathways for fgsea
+hallmark_pathway_list_7.2 <- hallmark_pathways_7.2 %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+# Step 3: Loop Through Each Pair and Perform GSEA
+results_list <- list()
+plots_list <- list()
+
+for (pair in pairs) {
+  dx_col <- pair$Dx
+  rx_col <- pair$Rx
+  
+  # Ensure both columns exist in the dataset
+  if (dx_col %in% colnames(matts_df_LH_7.2) && rx_col %in% colnames(matts_df_LH_7.2)) {
+    # Calculate log2 fold changes
+    gene_ranks <- log2(matts_df_LH_7.2[[rx_col]] + 1) - log2(matts_df_LH_7.2[[dx_col]] + 1)
+    names(gene_ranks) <- rownames(matts_df_LH_7.2)  # Assign gene names
+    
+    # Add small random noise to break ties
+    set.seed(123)
+    gene_ranks <- gene_ranks + runif(length(gene_ranks), min = -1e-6, max = 1e-6)
+    
+    # Perform GSEA
+    fgsea_results <- fgsea(
+      pathways = hallmark_pathway_list_7.2,
+      stats = gene_ranks,
+      minSize = 10,
+      maxSize = 1000,
+      eps = 0
+    )
+    
+    # Tidy results
+    fgsea_tidy <- fgsea_results %>%
+      as_tibble() %>%
+      arrange(padj)
+    
+    # Filter significant pathways (padj < 0.1)
+    significant_pathways <- fgsea_tidy %>%
+      filter(padj < 0.05)
+    
+    # Save results for this pair
+    results_list[[paste0(dx_col, "_vs_", rx_col)]] <- fgsea_tidy
+    
+    # Plot top 20 pathways
+    plot <- fgsea_tidy %>%
+      filter(padj < 0.1) %>%
+      slice_min(padj, n = 20) %>%
+      ggplot(aes(x = reorder(pathway, NES), y = NES, fill = NES > 0)) +
+      geom_col() +
+      coord_flip() +
+      labs(
+        title = paste0("Top Enriched Pathways: ", dx_col, " vs ", rx_col),
+        x = "Pathway",
+        y = "Normalized Enrichment Score (NES)"
+      ) +
+      scale_fill_manual(values = c("TRUE" = "#61BB6F", "FALSE" = "#EC7012")) +
+      theme_minimal()
+    
+    plots_list[[paste0(dx_col, "_vs_", rx_col)]] <- plot
+  } else {
+    warning(paste("Columns not found for pair:", dx_col, rx_col))
+  }
+}
+
+```
+
+
+### Task 7.2.2 Take avarage expression and make hallmakrs
+
+```{r}
+# Separate D and R samples
+d_samples <- matts_df_LH_7.2 %>%
+  rownames_to_column("Gene") %>% 
+  dplyr::select(Gene, contains("-D"))
+
+r_samples <- matts_df_LH_7.2 %>%
+  rownames_to_column("Gene") %>% 
+  dplyr::select(Gene, contains("-R"))
+
+# Calculate average expression for D samples
+d_avg_expression <- d_samples %>%
+  rowwise() %>%
+  mutate(Average_D = mean(c_across(starts_with("LH")), na.rm = TRUE)) %>%
+  dplyr::select(Gene, Average_D)
+
+# Calculate average expression for R samples
+r_avg_expression <- r_samples %>%
+  rowwise() %>%
+  mutate(Average_R = mean(c_across(starts_with("LH")), na.rm = TRUE)) %>%
+  dplyr::select(Gene, Average_R)
+
+# Combine the average expressions into one dataframe
+avg_expression_df <- d_avg_expression %>%
+  inner_join(r_avg_expression, by = "Gene")
+
+# Calculate log2 fold change
+avg_expression_df <- avg_expression_df %>%
+  mutate(log2FC = log2(Average_R / Average_D))
+
+# Display the dataframe with log2FC
+print(avg_expression_df)
+
+# Filter genes based on log2FC > |1|
+filtered_avg_expression_df <- avg_expression_df %>%
+  filter(abs(log2FC) > 1)
+
+# Display the dataframe with log2FC
+print(filtered_avg_expression_df)
+```
+
+#### Running the GSEA
+
+```{r, fig.width=15}
+# Retrieve Hallmark gene sets for Homo sapiens
+hallmark_pathways_7.2.2 <- msigdbr(species = "Homo sapiens", category = "H")
+
+# Format pathways for fgsea
+hallmark_pathway_list_7.2.2 <- hallmark_pathways_7.2.2 %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+# Rank genes based on log2 fold change
+gene_ranks_7.2.2 <- avg_expression_df %>%
+  dplyr::select(Gene, log2FC) %>%
+  arrange(desc(log2FC)) %>%
+  deframe()
+
+# Ensure all values are finite
+gene_ranks_7.2.2 <- gene_ranks_7.2.2[is.finite(gene_ranks_7.2.2)]
+
+# Add small random noise to break ties
+set.seed(123)
+gene_ranks_7.2.2 <- gene_ranks_7.2.2 + runif(length(gene_ranks_7.2.2), min = -1e-6, max = 1e-6)
+
+# Perform GSEA with adjusted parameters
+fgsea_results_7.2.2 <- fgsea(
+  pathways = hallmark_pathway_list_7.2.2,
+  stats = gene_ranks_7.2.2,
+  minSize = 10,  # Reduced minSize to include smaller pathways
+  maxSize = 1000,  # Increased maxSize to include larger pathways
+  eps = 0
+)
+
+# Tidy the results
+fgsea_tidy_7.2.2 <- fgsea_results_7.2.2 %>%
+  as_tibble() %>%
+  arrange(padj)
+
+# Plot the top pathways
+plot_7.2.2 <- fgsea_tidy_7.2.2 %>%
+  ggplot(aes(x = reorder(pathway, NES), y = NES, fill = NES > 0)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Top Enriched Hallmark Pathways: Diagnosis vs Relapse (log2FC > |1|)",
+    x = "Pathway",
+    y = "Normalized Enrichment Score (NES)"
+  ) +
+  scale_fill_manual(values = c("TRUE" = "#61BB6F", "FALSE" = "#EC7012")) +
+  theme_minimal()
+
+# Display the plot
+print(plot_7.2.2)
+```
+
+### Task 7.2.3 Compare the pathways in stjudes Q4 vs DR Matss
+
+```{r}
+# Rank pathways by padj
+pathways_7_2_2 <- fgsea_tidy_7.2.2$pathway
+pathways_7_1_1 <- fgsea_tidy_7.1.1$pathway
+
+
+# Identify common and unique pathways
+common_pathways <- intersect(pathways_7_2_2, pathways_7_1_1)
+unique_to_7_2_2 <- setdiff(pathways_7_2_2, pathways_7_1_1)
+unique_to_7_1_1 <- setdiff(pathways_7_1_1, pathways_7_2_2)
+
+
+```
+#### Plotting
+
+```{r}
+# Create a list of pathways
+pathway_list <- list(
+  Relapse = pathways_7_2_2,
+  Q4 = pathways_7_1_1
+)
+
+# Plot the Venn diagram
+ggvenn(pathway_list, c("Relapse", "Q4"))
+```
+
+```{r, fig.height= 10, fig.width=10}
+# Extract NES for common pathways
+common_pathways_7_2_2 <- fgsea_tidy_7.2.2 %>%
+  filter(pathway %in% common_pathways) %>%
+  dplyr::select(pathway, NES) %>%
+  mutate(dataset = "Relapse")
+
+common_pathways_7_1_1 <- fgsea_tidy_7.1.1 %>%
+  filter(pathway %in% common_pathways) %>%
+  dplyr::select(pathway, NES) %>%
+  mutate(dataset = "Q4")
+
+# Combine the data
+common_pathways_df <- bind_rows(common_pathways_7_2_2, common_pathways_7_1_1)
+
+# Create the bar plot
+ggplot(common_pathways_df, aes(x = reorder(pathway, NES), y = NES, fill = dataset)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  coord_flip() +
+  labs(
+    title = "Comparison of Common Pathways: Relapse vs Q4",
+    x = "Pathway",
+    y = "Normalized Enrichment Score (NES)"
+  ) +
+  scale_fill_manual(values = c("Relapse" = "#61BB6F", "Q4" = "#EC7012")) +
+  theme_minimal()
+```
+#### Extracting leading genes
+```{r}
+# Extract leading edge genes for common pathways in Relapse dataset
+leading_genes_7_2_2 <- fgsea_tidy_7.2.2 %>%
+  filter(pathway %in% common_pathways) %>%
+  dplyr::select(pathway, leadingEdge) %>%
+  unnest(cols = c(leadingEdge)) %>%
+  distinct()
+
+# Display the leading edge genes for Relapse dataset
+print(leading_genes_7_2_2)
+```
+
+#### Venn diagram for leading edfge genes
+
+```{r}
+# Function to create and save Venn diagram for a given pathway
+create_and_save_venn_diagram <- function(pathway, output_dir) {
+  # Extract leading edge genes for the pathway from both datasets
+  leading_genes_7_2_2 <- fgsea_tidy_7.2.2 %>%
+    filter(pathway == !!pathway) %>%
+    dplyr::select(leadingEdge) %>%
+    unnest(cols = c(leadingEdge)) %>%
+    distinct() %>%
+    pull(leadingEdge)
+  
+  leading_genes_7_1_1 <- fgsea_tidy_7.1.1 %>%
+    filter(pathway == !!pathway) %>%
+    dplyr::select(leadingEdge) %>%
+    unnest(cols = c(leadingEdge)) %>%
+    distinct() %>%
+    pull(leadingEdge)
+  
+  # Create a list of leading edge genes
+  gene_list <- list(
+    Relapse = leading_genes_7_2_2,
+    Q4 = leading_genes_7_1_1
+  )
+  
+  # Plot the Venn diagram
+  venn_plot <- ggvenn(
+    data = gene_list,
+    columns = c("Relapse", "Q4"),
+    fill_color = c("#FF9999", "#99CCFF"),
+    fill_alpha = 0.6,
+    stroke_color = "black",
+    stroke_size = 1,
+    set_name_color = "black",
+    set_name_size = 6,
+    text_color = "black",
+    text_size = 4,
+    show_percentage = TRUE,
+    digits = 1
+  ) +
+    ggtitle(paste("Venn Diagram of Leading Edge Genes for", pathway)) +
+    theme(plot.title = element_text(size = 14, face = "bold"))
+  
+  # Save the plot to a PDF file
+  ggsave(
+    filename = paste0(output_dir, "/", gsub(" ", "_", pathway), ".pdf"),
+    plot = venn_plot,
+    width = 8,
+    height = 6
+  )
+}
+
+# Directory to save the plots
+output_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Integrated_D_R_curtis/tasks_results/task7/task7.2/task7.2.3"
+
+# Create and save Venn diagrams for each common pathway
+for (pathway in common_pathways) {
+  create_and_save_venn_diagram(pathway, output_dir)
+}
+```
+
+#### List of genes:
+
+```{r}
+
+# Function to find overlapping genes for a given pathway
+find_overlapping_genes <- function(pathway) {
+  # Extract leading edge genes for the pathway from both datasets
+  leading_genes_7_2_2 <- fgsea_tidy_7.2.2 %>%
+    filter(pathway == !!pathway) %>%
+    dplyr::select(leadingEdge) %>%
+    unnest(cols = c(leadingEdge)) %>%
+    distinct() %>%
+    pull(leadingEdge)
+  
+  leading_genes_7_1_1 <- fgsea_tidy_7.1.1 %>%
+    filter(pathway == !!pathway) %>%
+    dplyr::select(leadingEdge) %>%
+    unnest(cols = c(leadingEdge)) %>%
+    distinct() %>%
+    pull(leadingEdge)
+  
+  # Find overlapping genes
+  overlapping_genes <- intersect(leading_genes_7_2_2, leading_genes_7_1_1)
+  
+  return(overlapping_genes)
+}
+
+# Create a list to store overlapping genes for each pathway
+overlapping_genes_list <- list()
+
+# Find overlapping genes for each common pathway
+for (pathway in common_pathways) {
+  overlapping_genes_list[[pathway]] <- find_overlapping_genes(pathway)
+}
+
+# Print the overlapping genes for each pathway
+overlapping_genes_list
+
+# Create a data frame from the list of overlapping genes
+overlapping_genes_df <- bind_rows(lapply(overlapping_genes_list, function(x) {
+  data.frame(Gene = x)
+}), .id = "Pathway")
+
+# Print the data frame
+print(overlapping_genes_df)
+
+write.csv(overlapping_genes_df, "/Users/cojulian/Desktop/Tzu_projects/Matt/Integrated_D_R_curtis/tasks_results/task7/task7.2/task7.2.3/overlapping_genes.csv", row.names = F)
+
+```
+
+
+## Task 7.3 Heatmap containing only chromosome 8 genes for diagnosis versus relapse of the three LH samples. Here, I want to see if GEM upregulation is just due to chromosome 8 genes generally being upregulated.
+
+```{r}
+# Connect to the Ensembl BioMart
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+# Get the list of genes on chromosome 8
+chr8_genes <- getBM(attributes = c("hgnc_symbol", "chromosome_name"),
+                    filters = "chromosome_name",
+                    values = "8",
+                    mart = ensembl)
+
+# Extract the gene symbols
+chr8_gene_symbols <- chr8_genes$hgnc_symbol
+```
+
+```{r}
+chromosome_8_data_7.2 <- matts_df_LH_7.2 %>%
+  rownames_to_column("Gene") %>% 
+  filter(Gene %in% chr8_gene_symbols)
+
+
+# Check for missing genes
+missing_chr8_genes <- setdiff(chr8_gene_symbols, chromosome_8_data_7.2$Gene)
+if (length(missing_chr8_genes) > 0) {
+  cat("The following chromosome 8 genes are missing from the data:\n")
+  print(missing_chr8_genes)
+}
+
+
+
+# Step 3: Separate Diagnosis and Relapse Samples
+diagnosis_data_7.2 <- chromosome_8_data_7.2 %>%
+  column_to_rownames("Gene") %>%  # Use Gene column as row names
+  dplyr::select(matches("-D$"))
+
+relapse_data_7.2 <- chromosome_8_data_7.2 %>%
+  column_to_rownames("Gene") %>%  # Use Gene column as row names
+  dplyr::select(matches("-R$"))
+
+# Combine Diagnosis and Relapse Data
+heatmap_data_7.2 <- cbind(diagnosis_data_7.2, relapse_data_7.2)
+```
+
+```{r}
+# Calculate z-scores
+# Calculate Z-Scores
+heatmap_data_zscore_7.2 <- t(scale(t(heatmap_data_7.2)))
+heatmap_data_zscore_7.2[is.na(heatmap_data_zscore_7.2)] <- 0
+
+```
+
+
+```{r}
+# Step 5: Create Metadata for Heatmap Annotation
+annotation <- data.frame(
+  Condition = rep(c("Diagnosis", "Relapse"), each = ncol(diagnosis_data_7.2)),
+  row.names = colnames(heatmap_data_zscore_7.2)
+)
+
+```
+
+```{r, fig.width=20, fig.height=20}
+pheatmap(
+  heatmap_data_zscore_7.2,
+  cluster_rows = F,
+  cluster_cols = F,
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  main = "Chromosome 8 Genes: Diagnosis vs Relapse (Z-score)",
+  color = colorRampPalette(c("blue", "white", "red"))(50),
+  annotation_col = annotation,
+  fontsize_row = 13,
+  fontsize = 20,
+  fontsize_col = 13
+)
+```
+
+
+### top 50 and top 100 
+
+```{r}
+# Calculate standard deviation for each gene
+gene_variability <- apply(heatmap_data_zscore_7.2, 1, sd, na.rm = TRUE)
+
+# Get top 100 genes
+top_100_genes <- names(sort(gene_variability, decreasing = TRUE)[1:100])
+
+# Get top 50 genes
+top_50_genes <- names(sort(gene_variability, decreasing = TRUE)[1:50])
+
+# Subset the data for top 100 and top 50 genes
+heatmap_data_top_100 <- heatmap_data_zscore_7.2[top_100_genes, ]
+heatmap_data_top_50 <- heatmap_data_zscore_7.2[top_50_genes, ]
+
+```
+
+```{r, fig.width=21, fig.height=20}
+pheatmap(
+  heatmap_data_top_100,
+  cluster_rows = F,    # Enable clustering for better visualization
+  cluster_cols = F,
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  main = "Top 100 Chromosome 8 Genes: Diagnosis vs Relapse (Z-score)",
+  color = colorRampPalette(c("blue", "white", "red"))(50),
+  annotation_col = annotation,
+  fontsize_row = 13,
+  fontsize = 20,
+  fontsize_col = 13
+)
+
+```
+
+
+```{r, fig.width=22, fig.height=20}
+pheatmap(
+  heatmap_data_top_50,
+  cluster_rows = F,    # Enable clustering for better visualization
+  cluster_cols = F,
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  main = "Top 50 Chromosome 8 Genes: Diagnosis vs Relapse (Z-score)",
+  color = colorRampPalette(c("blue", "white", "red"))(50),
+  annotation_col = annotation,
+  fontsize_row = 13,
+  fontsize = 20,
+  fontsize_col = 13
+)
+
+```
+
+# Task 8. Kaplan Meyer cBioPortal Pan Cancer
+
+```{r}
+
+```
+
+```{r}
+# Initialize connection to cBioPortal
+cbio <- cBioPortal()
+```
+
+```{r}
+# Get list of all studies
+studies <- getStudies(cbio)
+
+# Filter studies likely containing RNA expression data
+gem_related_studies <- studies %>%
+  filter(grepl("RNA", description, ignore.case = TRUE) |
+         grepl("expression", description, ignore.case = TRUE))
+
+# View relevant studies
+print(gem_related_studies)
+
+```
+
+```{r}
+# Example study ID (replace with the one of interest)
+study_id <- "pog570_bcgsc_2020"  # Example
+
+# Get molecular profiles for the study
+profiles <- molecularProfiles(cbio, study_id)
+
+pan_Multiassay = cBioDataPack(cancer_study_id = "pog570_bcgsc_2020")
+```
+
+```{r}
+experiments(pan_Multiassay)
+```
+```{r}
+colData(pan_Multiassay)[1:10, 1:10]
+```
+
+```{r}
+sampleMap(pan_Multiassay)
+metadata(pan_Multiassay)$name
+metadata(pan_Multiassay)$description
+```
+
+```{r}
+MAE = pan_Multiassay[,, "mrna_seq_rpkm"]
+
+assay(MAE)
+```
+
+
+```{r, fig.height=5, fig.width=10}
+pan_clinical_data = clinicalData(cbio,
+studyId = study_id)
+
+coldata = as.data.frame(colData(MAE))
+
+# Merge the clinical data with the colData
+coldata_extended <- merge(
+  pan_clinical_data[, c("patientId", "AGE", "GENDER", "OS_MONTHS", "OS_STATUS")],
+  coldata,
+  by.x = "patientId",
+  by.y = "PATIENT_ID",
+  all = TRUE
+)
+```
+
+### Ploting for all cancers that have more than 4 samples:
+
+```{r}
+# Directory to save the plots
+output_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Integrated_D_R_curtis/tasks_results/task8"
+
+# Create the directory if it does not exist
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+# Filter cancer types with more than 3 patients
+valid_cancer_types <- names(table(pan_clinical_data$CANCER_TYPE)[table(pan_clinical_data$CANCER_TYPE) > 3])
+
+# Loop through each valid cancer type
+for (cancer_type in valid_cancer_types) {
+  # Subset the clinical data for the specific cancer type
+  cancer_clinical_data <- subset(pan_clinical_data, CANCER_TYPE == cancer_type)
+  
+  if ("GEM" %in% rownames(assays(MAE)$mrna_seq_rpkm)) {
+    # Match sample IDs between assay data and clinical data
+    matched_samples <- colnames(assays(MAE)$mrna_seq_rpkm) %in% cancer_clinical_data$sampleId
+    
+    # Extract GEM expression for matched samples
+    gem_expression <- assays(MAE)$mrna_seq_rpkm["GEM", matched_samples]
+    
+    # Align GEM expression to clinical data
+    cancer_clinical_data$GEM_expression <- gem_expression[match(
+      cancer_clinical_data$sampleId,
+      colnames(assays(MAE)$mrna_seq_rpkm)[matched_samples]
+    )]
+    
+    # Categorize GEM expression into "Low" and "High" groups
+    cancer_clinical_data$GEM_group <- ifelse(
+      cancer_clinical_data$GEM_expression > median(cancer_clinical_data$GEM_expression, na.rm = TRUE),
+      "High",
+      "Low"
+    )
+    
+    # Ensure survival status is properly coded
+    cancer_clinical_data$OS_STATUS <- ifelse(grepl("LIVING", cancer_clinical_data$OS_STATUS), 0, 1)
+    
+    # Create the survival object
+    cancer_clinical_data$y <- Surv(
+      time = as.numeric(cancer_clinical_data$OS_MONTHS),
+      event = cancer_clinical_data$OS_STATUS
+    )
+    
+    # Check if there are at least 2 groups to stratify (High and Low)
+    if (length(unique(cancer_clinical_data$GEM_group)) > 1) {
+      # Fit Kaplan-Meier model stratified by GEM expression group
+      fit <- survfit(y ~ GEM_group, data = cancer_clinical_data)
+      
+      # Get the total number of patients included in the plot
+      num_patients <- nrow(cancer_clinical_data[!is.na(cancer_clinical_data$GEM_expression), ])
+      
+      # Plot the Kaplan-Meier survival curve
+      g <- ggsurvplot(
+        fit = fit,
+        data = cancer_clinical_data,
+        risk.table = TRUE,  # Add a risk table
+        pval = TRUE,        # Show p-value for log-rank test
+        title = paste(
+          "Kaplan-Meier Survival Analysis for", cancer_type,
+          "\nStratified by GEM Expression (N =", num_patients, ")"
+        ),
+        xlab = "Overall Survival (Months)",
+        ylab = "Survival Probability",
+        legend.title = "GEM Expression"
+      )
+      
+      print(g$plot)
+      
+      # Save the plot as a PDF
+      pdf_filename <- paste0(output_dir, "/KM_plot_", gsub(" ", "_", cancer_type), ".pdf")
+      ggsave(
+        filename = pdf_filename,
+        plot = g$plot,
+        width = 10,
+        height = 6
+      )
+      
+      cat("Plot saved for cancer type:", cancer_type, "with", num_patients, "patients\n")
+    } else {
+      cat("Skipping", cancer_type, "due to insufficient stratification groups.\n")
+    }
+  } else {
+    stop("Gene 'GEM' not found in row names of the assay matrix.")
+  }
+}
+
+```
+
+
+
+### Trying bone-related cancers only
+
+```{r}
+# Filter the studies for the relevant bone cancer studies
+bone_cancer_studies <- studies %>%
+  filter(name %in% c(
+    "Pediatric Ewing Sarcoma (DFCI, Cancer Discov 2014)",
+    "Ewing Sarcoma (Institut Curie, Cancer Discov 2014)",
+    "Adult Soft Tissue Sarcomas (TCGA, Cell 2017)",
+    "Sarcoma (MSKCC/Broad, Nat Genet 2010)",
+    "Sarcoma (MSK, Nat Commun. 2022)",
+    "Leiomyosarcoma (MSK, Clin Cancer Res 2024)",
+    "Soft Tissue and Bone Sarcoma (MSK, Nat Commun 2022)",
+    "Sarcoma (TCGA, Firehose Legacy)",
+    "Rhabdomyosarcoma (NIH, Cancer Discov 2014)",
+    "Pediatric Rhabdomyosarcomas (MSK, JCO Precis Oncol 2023)",
+    "Rhabdomyosarcomas (MSK, NPJ Precis Oncol 2023)"
+  ))
+
+# Print the filtered studies
+print(bone_cancer_studies)
+
+```
+## Maybe look for CNA amplification of the gene in this data
+
+
+## This has been a test 
+
+
+
+
+
+
+
+
+
+
+
+
+
