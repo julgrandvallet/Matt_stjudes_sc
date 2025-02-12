@@ -727,7 +727,10 @@ for (i in seq_along(target_genes)) {
 
 ```{r}
 # Extract the gene names from lowexp_filt_heatmap_data
-genes_to_keep <- rownames(lowexp_filt_heatmap_data)
+lowexp_filt_stjudes <- read_csv("tasks_results/lowexpressing_filteredout/lowexpr_stjudes_LH_NH_zscore2.5_ln2pfpkm1.csv") %>% 
+  column_to_rownames("...1")
+
+genes_to_keep <- rownames(lowexp_filt_stjudes)
 
 # Filter filtered_bulk_matrix to retain only the genes in genes_to_keep
 filtered_bulk_matrix_subset <- filtered_bulk_matrix[rownames(filtered_bulk_matrix) %in% genes_to_keep, ]
@@ -764,44 +767,58 @@ pheatmap::pheatmap(
 )
 ```
 
-## Rownormalizing this
+## Task of Febryary 10
 
 ```{r}
-# Step 1: Calculate Z-scores for all genes in filtered_bulk_matrix
-filtered_bulk_matrix_zscore <- t(apply(filtered_bulk_matrix, 1, function(x) {
-  (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
-}))
+library(dplyr)
 
-# Step 2: Filter for genes of interest
-# Extract the gene names from lowexp_filt_heatmap_data
-genes_to_keep <- rownames(lowexp_filt_heatmap_data)
+# Function to perform t-test for a single gene
+perform_t_test <- function(gene_expression, diagnosis_samples, relapse_samples) {
+  t_test_result <- t.test(
+    gene_expression[relapse_samples], 
+    gene_expression[diagnosis_samples], 
+    alternative = "greater",  # One-tailed test: relapse > diagnosis
+    paired = FALSE            # Assuming samples are NOT paired
+  )
+  return(t_test_result$p.value)
+}
 
-# Subset the Z-score matrix to retain only the genes in genes_to_keep
-filtered_bulk_matrix_subset_zscore <- filtered_bulk_matrix_zscore[rownames(filtered_bulk_matrix_zscore) %in% genes_to_keep, ]
+# Get column indices for LH Diagnosis and LH Relapse samples
+lh_diagnosis_cols <- grep("LH.*-D", colnames(filtered_bulk_matrix_subset))
+lh_relapse_cols <- grep("LH.*-R", colnames(filtered_bulk_matrix_subset))
 
-# Check the result
-dim(filtered_bulk_matrix_subset_zscore)
+# Perform t-test for each gene and store p-values
+p_values <- apply(filtered_bulk_matrix_subset, 1, function(gene_expression) {
+  perform_t_test(gene_expression, lh_diagnosis_cols, lh_relapse_cols)
+})
 
-library(pheatmap)
-
-# Set 'Gene' as row names and convert to a numeric matrix
-filtered_bulk_heatmap_data <- filtered_bulk_matrix_subset_zscore %>%
-  as.matrix()
-
-# Generate the heatmap
-pheatmap::pheatmap(
-  filtered_bulk_heatmap_data,
-  cluster_rows = T,       # Cluster rows (genes)
-  cluster_cols = T,       # Cluster columns (samples)
-  main = "Z-Score Heatmap of Filtered Bulk Matrix",  # Heatmap title
-  show_rownames = TRUE,       # Show gene names (set to FALSE if too many genes)
-  show_colnames = TRUE,       # Show sample names
-  color = colorRampPalette(c("blue", "white", "red"))(50),  # Color gradient
-  fontsize_col = 8,           # Font size for column names
-  fontsize_row = 6            # Font size for row names
+# Create a comparison data frame
+comparison_df <- data.frame(
+  Gene = rownames(filtered_bulk_matrix_subset),
+  Avg_LH_Diagnosis = rowMeans(filtered_bulk_matrix_subset[, lh_diagnosis_cols], na.rm = TRUE),
+  Avg_LH_Relapse = rowMeans(filtered_bulk_matrix_subset[, lh_relapse_cols], na.rm = TRUE),
+  p_value = p_values,
+  stringsAsFactors = FALSE
 )
 
+# Rank genes by raw (unadjusted) p-value in ascending order (smallest p-value = most significant)
+comparison_df <- comparison_df %>% arrange(p_value)
+
+# Apply Benjamini-Hochberg correction for multiple testing
+comparison_df$adjusted_p_value <- p.adjust(comparison_df$p_value, method = "BH")
+
+# View top-ranked genes by raw p-value
+head(comparison_df)
+
+# Optionally, save results to a CSV file
+write.csv(comparison_df, "LH_gene_ranking_by_ttest.csv", row.names = FALSE)
+
 ```
+
+
+
+
+
 
 
 # Task 2 D vs R per subtype
@@ -2610,6 +2627,8 @@ library(pheatmap)
 lowexp_filt_heatmap_data <- lowexp_filt_highzscore_log2fpkm_filt %>%
   column_to_rownames("Gene") %>%
   as.matrix()
+
+write.csv(lowexp_filt_heatmap_data, "tasks_results/lowexpressing_filteredout/lowexpr_stjudes_LH_NH_zscore2.5_ln2pfpkm1.csv", row.names = T)
 
 # Generate the heatmap
 pheatmap::pheatmap(
@@ -4595,6 +4614,35 @@ print(bone_cancer_studies)
 ## This has been a test 
 
 
+### Matts gene list
+
+```{r}
+Gene_List_for_Julian <- read_excel("Gene List for Julian.xlsx")
+
+Gene_List_for_Julian
+```
+
+GO
+
+```{r}
+
+gene_list_HF <- Gene_List_for_Julian %>% 
+    filter(type == "HF") %>% 
+    pull(Gene)
+
+gene_list_LF <- Gene_List_for_Julian %>% 
+    filter(type == "LF") %>% 
+    pull(Gene)
+
+
+# Perform GO enrichment analysis
+go_enrich_HF <- enrichGO(gene = gene_list_HF, OrgDb = org.Hs.eg.db, keyType = "SYMBOL", ont = "BP", pAdjustMethod = "BH", qvalueCutoff = 0.05)
+go_enrich_LF <- enrichGO(gene = gene_list_LF, OrgDb = org.Hs.eg.db, keyType = "SYMBOL", ont = "BP", pAdjustMethod = "BH", qvalueCutoff = 0.05)
+
+# View results
+head(go_enrich_HF)
+head(go_enrich_LF)
+```
 
 
 
